@@ -7,8 +7,8 @@ require('dotenv').config();
 app.use(express.json());
 
 // Initialize Gemini with two different API keys
-const generalGenAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY_GENERAL);
-const tutorGenAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY_TUTOR);
+const generalGenAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY_GENERAL, { apiVersion: "v1" });
+const tutorGenAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY_TUTOR, { apiVersion: "v1" });
 
 const generalModel = generalGenAI.getGenerativeModel({ model: "gemini-pro" });
 const tutorModel = tutorGenAI.getGenerativeModel({ model: "gemini-pro" }); // Adjust model if different
