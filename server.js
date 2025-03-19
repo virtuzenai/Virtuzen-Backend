@@ -10,14 +10,23 @@ app.use(cors());
 const API_URL = "https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent";
 const API_KEY = process.env.GEMINI_API_KEY;
 
-app.post("/api/chat/general", async (req, res) => {
+app.post("/api/chat", async (req, res) => {
     try {
         const userMessage = req.body.message;
+        const type = req.body.type || "general"; // Default to "general"
+
+        // Customizing prompt for different types
+        let prompt;
+        if (type === "tutor") {
+            prompt = `You are a tutor. Explain in detail: ${userMessage}`;
+        } else {
+            prompt = userMessage;
+        }
 
         const response = await axios.post(
             `${API_URL}?key=${API_KEY}`,
             {
-                contents: [{ parts: [{ text: userMessage }] }]
+                contents: [{ parts: [{ text: prompt }] }]
             },
             { headers: { "Content-Type": "application/json" } }
         );
