@@ -1,0 +1,29 @@
+swa-backend/
+├── models/
+│   ├── Workflow.js
+│   ├── Task.js
+│   ├── Report.js
+│   └── User.js
+├── routes/
+│   ├── auth.js
+│   ├── dashboard.js
+│   ├── settings.js
+│   ├── workflows.js
+│   ├── reports.js
+│   └── tasks.js
+├── middleware/
+│   ├── auth.js
+│   ├── errorHandler.js
+│   ├── rateLimiter.js
+│   └── validate.js
+├── config/
+│   ├── db.js
+│   └── logger.js
+├── services/
+│   ├── workflowScheduler.js
+│   └── socket.js
+├── .env
+├── .gitignore
+├── package.json
+├── render.yaml
+└── index.js
