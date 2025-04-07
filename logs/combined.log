@@ -1,0 +1,12 @@
+{"level":"info","message":"Server running on port 3000","timestamp":"2025-04-07T01:15:16.242Z"}
+{"code":"ENOTFOUND","hostname":"_mongodb._tcp.cluster0.mongodb.net","level":"error","message":"MongoDB connection error: querySrv ENOTFOUND _mongodb._tcp.cluster0.mongodb.net","stack":"Error: querySrv ENOTFOUND _mongodb._tcp.cluster0.mongodb.net\n    at QueryReqWrap.onresolve [as oncomplete] (node:internal/dns/promises:293:17)","syscall":"querySrv","timestamp":"2025-04-07T01:15:16.311Z"}
+{"level":"info","message":"Server running on port 3000","timestamp":"2025-04-07T01:18:41.991Z"}
+{"code":"ENOTFOUND","hostname":"_mongodb._tcp.cluster0.mongodb.net","level":"error","message":"MongoDB connection error: querySrv ENOTFOUND _mongodb._tcp.cluster0.mongodb.net","stack":"Error: querySrv ENOTFOUND _mongodb._tcp.cluster0.mongodb.net\n    at QueryReqWrap.onresolve [as oncomplete] (node:internal/dns/promises:293:17)","syscall":"querySrv","timestamp":"2025-04-07T01:18:42.165Z"}
+{"level":"info","message":"Server running on port 3000","timestamp":"2025-04-07T01:20:50.971Z"}
+{"code":"ENOTFOUND","hostname":"_mongodb._tcp.cluster0.mongodb.net","level":"error","message":"MongoDB connection error: querySrv ENOTFOUND _mongodb._tcp.cluster0.mongodb.net","stack":"Error: querySrv ENOTFOUND _mongodb._tcp.cluster0.mongodb.net\n    at QueryReqWrap.onresolve [as oncomplete] (node:internal/dns/promises:293:17)","syscall":"querySrv","timestamp":"2025-04-07T01:20:51.091Z"}
+{"level":"info","message":"Server running on port 3000","timestamp":"2025-04-07T01:24:27.051Z"}
+{"level":"info","message":"MongoDB connected successfully","timestamp":"2025-04-07T01:24:29.322Z"}
+{"level":"info","message":"Automation Test Automation completed","timestamp":"2025-04-07T01:25:25.908Z"}
+{"level":"info","message":"Server running on port 3000","timestamp":"2025-04-07T01:32:52.840Z"}
+{"level":"info","message":"MongoDB connected successfully","timestamp":"2025-04-07T01:32:54.283Z"}
+{"level":"info","message":"Automation Test Automation completed","timestamp":"2025-04-07T01:33:15.432Z"}
