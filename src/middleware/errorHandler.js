@@ -1,8 +1,11 @@
 const logger = require('../logger');
 
-const errorHandler = (error, req, res, next) => {
-  logger.error(`Error: ${error.message}`);
-  res.status(400).json({ message: error.message || 'Something went wrong' });
+const errorHandler = (err, req, res, next) => {
+  logger.error(`${req.method} ${req.url} - Error: ${err.message}`, err);
+  res.status(err.status || 500).json({
+    message: err.message || 'Internal Server Error',
+    ...(process.env.NODE_ENV === 'development' && { stack: err.stack }),
+  });
 };
 
 module.exports = errorHandler;
