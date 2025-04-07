@@ -5,7 +5,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import logging
 
-from email_automation import process_emails  # Updated import
+from email_automation import process_emails
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
@@ -19,7 +19,7 @@ monitor_running = False
 def email_monitor_loop(interval=15):
     global monitor_running
     while monitor_running:
-        process_emails()  # Updated to call process_emails
+        process_emails()
         time.sleep(interval)
 
 class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
@@ -38,6 +38,10 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
             self.send_json_response({"status": "ok", "message": "Email automation server is running"})
         else:
             self.send_json_response({"status": "error", "message": "Invalid endpoint"})
+
+    def do_HEAD(self):  # Added to handle HEAD requests
+        self._set_headers()
+        # No body is sent for HEAD requests, just headers
 
     def do_POST(self):
         global monitor_thread
