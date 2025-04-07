@@ -5,7 +5,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import logging
 
-from email_automation import check_emails_and_respond
+from email_automation import process_emails  # Updated import
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
@@ -19,7 +19,7 @@ monitor_running = False
 def email_monitor_loop(interval=15):
     global monitor_running
     while monitor_running:
-        check_emails_and_respond()
+        process_emails()  # Updated to call process_emails
         time.sleep(interval)
 
 class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
