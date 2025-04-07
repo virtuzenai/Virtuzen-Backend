@@ -40,12 +40,14 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
             self.send_json_response({"status": "error", "message": "Invalid endpoint"})
 
     def do_POST(self):
+        global monitor_thread
+        global monitor_running
+
         content_length = int(self.headers.get("Content-Length", 0))
         post_data = self.rfile.read(content_length).decode("utf-8")
         logger.info(f"Received POST data: {post_data}")
 
         if self.path == "/start_monitor":
-            global monitor_thread, monitor_running
             if not monitor_running:
                 monitor_thread = threading.Thread(target=email_monitor_loop, args=(15,))
                 monitor_thread.daemon = True
@@ -58,7 +60,6 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
                 logger.warning("Attempted to start monitor while already running.")
 
         elif self.path == "/stop_monitor":
-            global monitor_running
             if monitor_running:
                 monitor_running = False
                 self.send_json_response({"status": "success", "message": "Email monitor stopped"})
