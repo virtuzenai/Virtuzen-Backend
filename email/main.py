@@ -42,13 +42,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Email credentials (default values, will be updated by user)
-your_email = "ivanlloydarig14@gmail.com"
-your_app_password = "dsub gwvx pxfy tusj"
-test_recipient = "ivanlloydroquero18@gmail.com"
-company_name = "Workflow Solutions"
-agent_name = "Ivan"
-forward_email = "example@gmail.com"
+# Email credentials (initially empty, will be set by user)
+your_email = ""
+your_app_password = ""
+company_name = ""
+agent_name = ""
+forward_email = ""
 
 # Gemini API setup
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyC4B45yRMZO2VVMzGYtLh-uW49Us0W-Ix8")
@@ -426,6 +425,7 @@ def send_email(from_email: str, to_email: str, subject: str, body: str, thread_i
     try:
         if not re.match(r"[^@]+@[^@]+\.[^@]+", to_email):
             logger.error(f"Invalid email address: {to_email}")
+            monitor_logs.put(f"Invalid email address: {to_email}")
             return {"status": "error", "message": "Invalid email address."}
 
         parsed_schedule_time = None
@@ -434,6 +434,7 @@ def send_email(from_email: str, to_email: str, subject: str, body: str, thread_i
                 parsed_schedule_time = datetime.fromisoformat(schedule_time)
             except ValueError as e:
                 logger.error(f"Invalid schedule_time format: {schedule_time}. Expected ISO format (e.g., '2025-04-08T12:00:00'). Error: {str(e)}")
+                monitor_logs.put(f"Invalid schedule_time format: {schedule_time}")
                 return {"status": "error", "message": f"Invalid schedule_time format: {str(e)}. Expected ISO format (e.g., '2025-04-08T12:00:00')."}
         elif isinstance(schedule_time, datetime):
             parsed_schedule_time = schedule_time
@@ -453,6 +454,7 @@ def send_email(from_email: str, to_email: str, subject: str, body: str, thread_i
         if len(recent_emails) >= 5:
             parsed_schedule_time = predict_send_time(to_email)
             logger.info(f"Rate limit hit, scheduling email for {parsed_schedule_time} to {to_email}.")
+            monitor_logs.put(f"Rate limit hit, scheduling email for {parsed_schedule_time} to {to_email}")
 
         if parsed_schedule_time and parsed_schedule_time > datetime.now():
             email_history["scheduled_emails"].append({
@@ -460,6 +462,7 @@ def send_email(from_email: str, to_email: str, subject: str, body: str, thread_i
                 "thread_id": thread_id, "message_id": msg['Message-ID']
             })
             save_history()
+            monitor_logs.put(f"Scheduled email for {to_email} at {parsed_schedule_time}")
             return {"status": "scheduled", "message": f"Scheduled for {parsed_schedule_time}", "thread_id": thread_id, "message_id": msg['Message-ID']}
 
         for attempt in range(3):
@@ -480,14 +483,17 @@ def send_email(from_email: str, to_email: str, subject: str, body: str, thread_i
                     }
                 save_history()
                 logger.info(f"Email sent successfully to {to_email} with subject '{subject}'.")
+                monitor_logs.put(f"Email sent successfully to {to_email} with subject '{subject}'")
                 return {"status": "success", "message": "Email sent!", "thread_id": thread_id, "message_id": msg['Message-ID']}
             except Exception as e:
                 logger.warning(f"SMTP attempt {attempt + 1}/3 failed for {to_email}: {str(e)}")
+                monitor_logs.put(f"SMTP attempt {attempt + 1}/3 failed for {to_email}: {str(e)}")
                 if attempt == 2:
                     raise
                 time.sleep(2 ** attempt)
     except Exception as e:
         logger.error(f"Error sending email to {to_email}: {str(e)}")
+        monitor_logs.put(f"Error sending email to {to_email}: {str(e)}")
         return {"status": "error", "message": str(e)}
 
 # Fetch emails
@@ -507,6 +513,7 @@ def fetch_emails(criteria: str = "UNSEEN") -> List[Dict]:
                     status, msg_data = mail.fetch(email_id, "(RFC822)")
                     if status != "OK":
                         logger.warning(f"Failed to fetch email ID {email_id}.")
+                        monitor_logs.put(f"Failed to fetch email ID {email_id}")
                         continue
                     raw_email = msg_data[0][1]
                     email_message = email.message_from_bytes(raw_email)
@@ -538,6 +545,7 @@ def fetch_emails(criteria: str = "UNSEEN") -> List[Dict]:
                     }
                     if email_data["is_spam"]:
                         email_history["spam_emails"].append(email_data)
+                        monitor_logs.put(f"Detected spam email from {sender}")
                     else:
                         emails.append(email_data)
                         email_history["categories"][email_data["category"]] = email_history["categories"].get(email_data["category"], []) + [email_data["message_id"]]
@@ -545,14 +553,17 @@ def fetch_emails(criteria: str = "UNSEEN") -> List[Dict]:
                         mail.store(email_id, "+FLAGS", "\\Seen")
                 mail.logout()
                 logger.info(f"Fetched {len(emails)} emails with criteria {criteria}.")
+                monitor_logs.put(f"Fetched {len(emails)} emails with criteria {criteria}")
                 return sorted(emails, key=lambda x: x["priority_score"], reverse=True)
             except Exception as e:
                 logger.warning(f"IMAP attempt {attempt + 1}/3 failed: {str(e)}")
+                monitor_logs.put(f"IMAP attempt {attempt + 1}/3 failed: {str(e)}")
                 if attempt == 2:
                     raise
                 time.sleep(2 ** attempt)
     except Exception as e:
         logger.error(f"Error fetching emails with criteria {criteria}: {str(e)}")
+        monitor_logs.put(f"Error fetching emails with criteria {criteria}: {str(e)}")
         return []
 
 # Rules and processing
@@ -565,6 +576,7 @@ def apply_rules(email_data: Dict) -> Optional[Dict]:
         return None
     except Exception as e:
         logger.error(f"Error applying rules to email from {email_data.get('from', 'unknown')}: {str(e)}")
+        monitor_logs.put(f"Error applying rules to email from {email_data.get('from', 'unknown')}: {str(e)}")
         return None
 
 def process_emails() -> Dict:
@@ -576,6 +588,7 @@ def process_emails() -> Dict:
         for email_data in unread_emails:
             if email_data["is_spam"]:
                 logger.info(f"Skipping spam email from {email_data['from']}.")
+                monitor_logs.put(f"Skipping spam email from {email_data['from']}")
                 continue
             from_email = re.search(r"<(.+?)>", email_data["from"]) or email_data["from"]
             from_email = from_email.group(1) if isinstance(from_email, re.Match) else from_email
@@ -583,11 +596,13 @@ def process_emails() -> Dict:
             if rule_action:
                 results["processed"].append(rule_action)
                 logger.info(f"Applied rule to email from {from_email}: {rule_action}")
+                monitor_logs.put(f"Applied rule to email from {from_email}: {rule_action['message']}")
                 continue
             replies = gemini_generate_reply(email_data["body"], from_email, extract_sender_name(from_email), email_data["thread_id"], email_data["attachments"]) if model else [email_history["templates"]["thanks"].format(name=extract_sender_name(from_email), company=company_name)]
             result = send_email(your_email, from_email, email_data["subject"], replies[0], email_data["thread_id"], email_data["message_id"], attachments=email_data["attachments"])
             results["processed"].append({"to": from_email, "subject": email_data["subject"], "reply": result, "options": replies[1:]})
             logger.info(f"Processed email from {from_email}: {result['status']}")
+            monitor_logs.put(f"Processed email from {from_email}: {result['message']}")
             notification_queue.put(f"Replied to email from {from_email}: {result['message']}")
         
         unread_count = len(unread_emails)
@@ -595,27 +610,34 @@ def process_emails() -> Dict:
         new_count = sum(1 for e in all_emails if (datetime.now() - e["last_contact"]).total_seconds() < 300)
         if unread_count > 0:
             results["reminders"].append(f"You have {unread_count} unread email{'s' if unread_count > 1 else ''}.")
+            monitor_logs.put(f"Found {unread_count} unread emails")
         if new_count > 0:
             results["reminders"].append(f"You have {new_count} new email{'s' if new_count > 1 else ''} in the last 5 minutes.")
+            monitor_logs.put(f"Found {new_count} new emails in the last 5 minutes")
         if spam_count > 0:
             results["reminders"].append(f"You have {spam_count} spam email{'s' if spam_count > 1 else ''} detected.")
+            monitor_logs.put(f"Detected {spam_count} spam emails")
         results["insights"]["top_contact"] = max(email_history["analytics"]["busiest_contacts"], key=email_history["analytics"]["busiest_contacts"].get, default="None")
         
         save_history()
         logger.info("Email processing completed successfully.")
+        monitor_logs.put("Email processing completed successfully")
         return results
     except Exception as e:
         logger.error(f"Error processing emails: {str(e)}")
+        monitor_logs.put(f"Error processing emails: {str(e)}")
         return {"processed": [], "reminders": [f"Error processing emails: {str(e)}"], "analytics": email_history["analytics"], "insights": {}}
 
 # Background email monitoring
 notification_queue = queue.Queue()
+monitor_logs = queue.Queue()
 monitor_thread = None
 monitor_running = False
 
 def email_monitor_loop(interval: int = 5):
     global monitor_running
     logger.info("Starting email monitor in background...")
+    monitor_logs.put("Starting email monitor in background")
     def check_emails():
         while monitor_running:
             try:
@@ -624,15 +646,18 @@ def email_monitor_loop(interval: int = 5):
                     notification_queue.put(reminder)
                 for insight_key, insight_value in results["insights"].items():
                     notification_queue.put(f"Insight: {insight_key} = {insight_value}")
+                    monitor_logs.put(f"Insight: {insight_key} = {insight_value}")
                 scheduled = email_history["scheduled_emails"][:]
                 for email in scheduled:
                     if datetime.now() >= email["time"]:
                         send_result = send_email(your_email, email["to"], email["subject"], email["body"], email["thread_id"], email["message_id"])
                         email_history["scheduled_emails"].remove(email)
                         notification_queue.put(f"Scheduled email sent to {email['to']}: {send_result['message']}")
+                        monitor_logs.put(f"Scheduled email sent to {email['to']}: {send_result['message']}")
                 save_history()
             except Exception as e:
                 logger.error(f"Error in email monitor loop: {str(e)}")
+                monitor_logs.put(f"Error in email monitor loop: {str(e)}")
             time.sleep(interval)
     
     global monitor_thread
@@ -665,7 +690,6 @@ class ChatRequest(BaseModel):
 class CredentialsRequest(BaseModel):
     your_email: str
     your_app_password: str
-    test_recipient: str
     company_name: str
     agent_name: str
     forward_email: str
@@ -676,29 +700,35 @@ async def root():
 
 @app.post("/save-credentials")
 async def save_credentials(request: CredentialsRequest):
-    global your_email, your_app_password, test_recipient, company_name, agent_name, forward_email, EMAIL_HEADER, EMAIL_FOOTER
+    global your_email, your_app_password, company_name, agent_name, forward_email, EMAIL_HEADER, EMAIL_FOOTER
     try:
         your_email = request.your_email
         your_app_password = request.your_app_password
-        test_recipient = request.test_recipient
         company_name = request.company_name
         agent_name = request.agent_name
         forward_email = request.forward_email
         EMAIL_HEADER = f"\n{company_name}\n----------------------------------------"
         EMAIL_FOOTER = f"----------------------------------------\nBest regards,\n{agent_name}\n{company_name}"
         logger.info("SMTP credentials updated successfully.")
+        monitor_logs.put("SMTP credentials updated successfully")
         return {"message": "Credentials saved successfully!"}
     except Exception as e:
         logger.error(f"Failed to save credentials: {str(e)}")
+        monitor_logs.put(f"Failed to save credentials: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to save credentials: {str(e)}")
 
 @app.post("/start-monitor")
 async def start_monitor():
     global monitor_running
     if monitor_running:
+        monitor_logs.put("Monitor is already running")
         return {"message": "Monitor is already running."}
     if not your_email or not your_app_password:
+        monitor_logs.put("SMTP credentials not set")
         raise HTTPException(status_code=400, detail="SMTP credentials not set. Please save credentials first.")
+    if not model:
+        monitor_logs.put("Gemini API not available")
+        raise HTTPException(status_code=500, detail="Gemini API not available. Cannot start monitor.")
     monitor_running = True
     email_monitor_loop()
     return {"message": "Email monitor started."}
@@ -707,35 +737,48 @@ async def start_monitor():
 async def stop_monitor():
     global monitor_running, monitor_thread
     if not monitor_running:
+        monitor_logs.put("Monitor is not running")
         return {"message": "Monitor is not running."}
     monitor_running = False
     if monitor_thread:
         monitor_thread.join()
     return {"message": "Email monitor stopped."}
 
+@app.get("/monitor-logs")
+async def get_monitor_logs():
+    logs = []
+    while not monitor_logs.empty():
+        logs.append(monitor_logs.get())
+    return {"logs": logs}
+
 @app.post("/chat")
 async def chat_with_ai(request: ChatRequest):
     message = request.message.lower()
     try:
+        if not model:
+            monitor_logs.put("Gemini API not available for chat")
+            return {"response": "Gemini API not available. Please try again later."}
         if "write an email" in message:
             draft = message.replace("write an email", "").strip()
             response = gemini_write_email(draft)
-            return {"response": f"Here's your email draft:\n\n{response}"}
-        elif "email ideas" in message:
-            ideas = gemini_generate_email_ideas()
-            return {"response": f"Here are some email ideas:\n\n{ideas}"}
-        elif "summarize" in message:
-            email_content = message.replace("summarize", "").strip()
-            summary = gemini_summarize_email(email_content)
-            return {"response": f"Summary:\n\n{summary}"}
+                   elif "email ideas" in message:
+            response = gemini_generate_email_ideas()
         else:
-            return {"response": "I can help with email automation tasks! Try asking to 'write an email', 'give email ideas', or 'summarize' an email."}
+            prompt = f"You are {agent_name}, a superhuman AI from {company_name}. Respond to: '{message}' in a professional and helpful manner."
+            response = model.generate_content(prompt).text.strip()
+        logger.info(f"Chat response generated for message: {message}")
+        monitor_logs.put(f"Chat response generated for message: {message}")
+        return {"response": response}
     except Exception as e:
-        logger.error(f"Chat processing failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to process chat message: {str(e)}")
+        logger.error(f"Error in chat endpoint: {str(e)}")
+        monitor_logs.put(f"Error in chat endpoint: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error processing chat message: {str(e)}")
 
 @app.post("/send-email")
-async def api_send_email(request: EmailRequest):
+async def send_email_endpoint(request: EmailRequest):
+    if not your_email or not your_app_password:
+        monitor_logs.put("SMTP credentials not set for sending email")
+        raise HTTPException(status_code=400, detail="SMTP credentials not set. Please save credentials first.")
     try:
         result = send_email(
             from_email=your_email,
@@ -747,32 +790,39 @@ async def api_send_email(request: EmailRequest):
         )
         return result
     except Exception as e:
-        logger.error(f"API send-email failed for {request.to_email}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to send email: {str(e)}")
+        logger.error(f"Error in send-email endpoint: {str(e)}")
+        monitor_logs.put(f"Error in send-email endpoint: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/fetch-emails")
-async def api_fetch_emails(criteria: str = "UNSEEN"):
+async def fetch_emails_endpoint(criteria: str = "UNSEEN"):
+    if not your_email or not your_app_password:
+        monitor_logs.put("SMTP credentials not set for fetching emails")
+        raise HTTPException(status_code=400, detail="SMTP credentials not set. Please save credentials first.")
     try:
         emails = fetch_emails(criteria)
         return {"emails": emails}
     except Exception as e:
-        logger.error(f"API fetch-emails failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch emails: {str(e)}")
+        logger.error(f"Error in fetch-emails endpoint: {str(e)}")
+        monitor_logs.put(f"Error in fetch-emails endpoint: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/notifications")
-async def api_get_notifications():
+async def get_notifications():
     notifications = []
     while not notification_queue.empty():
         notifications.append(notification_queue.get())
     return {"notifications": notifications}
 
 @app.get("/history")
-async def api_get_history():
-    return email_history
+async def get_history():
+    try:
+        return email_history
+    except Exception as e:
+        logger.error(f"Error in history endpoint: {str(e)}")
+        monitor_logs.put(f"Error in history endpoint: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
+# Run the FastAPI server
 if __name__ == "__main__":
-    email_history["rules"]["urgent_forward"] = {
-        "condition": lambda e: "urgent" in e["body"].lower(),
-        "action": lambda e: send_email(your_email, forward_email, e["subject"], e["body"], forward=True)
-    }
     uvicorn.run(app, host="0.0.0.0", port=8000)
