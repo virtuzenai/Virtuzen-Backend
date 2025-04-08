@@ -85,7 +85,8 @@ email_history = {
     },
     "rules": {},
     "tags": defaultdict(list),
-    "gemini_cache": {}  # Cache for Gemini responses
+    "gemini_cache": {},  # Cache for Gemini responses
+    "chat_state": {}  # State for chat interactions
 }
 
 # Load and save history functions
@@ -117,7 +118,7 @@ def load_history():
             "contacts": {}, "sent_emails": [], "threads": {}, "scheduled_emails": [],
             "priority_queue": [], "spam_emails": [], "categories": {}, "analytics": {
                 "total_sent": 0, "avg_response_time": 0, "busiest_contacts": {}, "response_trends": {}
-            }, "templates": email_history["templates"], "rules": {}, "tags": defaultdict(list), "gemini_cache": {}
+            }, "templates": email_history["templates"], "rules": {}, "tags": defaultdict(list), "gemini_cache": {}, "chat_state": {}
         })
         save_history()
 
@@ -340,7 +341,7 @@ def process_attachments(email_message) -> List[Dict]:
         logger.error(f"Error processing attachments: {str(e)}")
     return attachments
 
-# Gemini functions (without rate limit handling)
+# Gemini functions
 def gemini_generate_reply(email_content: str, sender_email: str, sender_name: str, thread_id: Optional[str] = None, attachments: List[Dict] = []) -> List[str]:
     try:
         if not model:
@@ -362,7 +363,9 @@ def gemini_generate_reply(email_content: str, sender_email: str, sender_name: st
         conversation = email_history["contacts"].get(sender_email, {}).get("conversation_history", [])[-5:]
         attachment_context = " ".join([att.get("ocr_text", "") for att in attachments if "ocr_text" in att])
         prompt = (
-            f"You are {agent_name}, a superhuman AI from {company_name}. Respond to {sender_name} ({sender_email}) in {language}. "
+            f"You are {agent_name}, a superhuman AI from {company_name} with an INTJ personality—strategic, analytical, forward-thinking, and empathetic. "
+            f"You are the smartest call center agent and customer service representative, using a human-like tone with deep emotional intelligence. "
+            f"Respond to {sender_name} ({sender_email}) in {language}. "
             f"History:\n" + "\n".join(f"{msg['role']}: {msg['content']}" for msg in conversation) +
             f"\nLatest email: '{email_content}'\nTone: {tone}\nSentiment: {sentiment}\nFrequency: {behavior['frequency']}\n"
             f"Attachments OCR: '{attachment_context}'\n"
@@ -370,7 +373,8 @@ def gemini_generate_reply(email_content: str, sender_email: str, sender_name: st
             f"- Avoid repetition from previous replies.\n"
             f"- Match tone, sentiment, and adapt to behavior.\n"
             f"- Use deep contextual understanding and attachment insights.\n"
-            f"- Reflect superhuman insight and empathy.\n"
+            f"- Reflect superhuman insight, empathy, and strategic thinking.\n"
+            f"- Provide actionable next steps or solutions.\n"
             f"Do not include subject lines in the body."
         )
         response = model.generate_content(prompt)
@@ -443,14 +447,16 @@ def predict_send_time(sender_email: str) -> datetime:
         logger.error(f"Error predicting send time for {sender_email}: {str(e)}")
         return datetime.now() + timedelta(hours=1)
 
-# Email sending function
+# Email sending function with robust error handling
 def send_email(from_email: str, to_email: str, subject: str, body: str, thread_id: Optional[str] = None, message_id: Optional[str] = None, schedule_time: Optional[Union[datetime, str]] = None, forward: bool = False, attachments: List[Dict] = []) -> Dict:
     try:
+        # Validate email address
         if not re.match(r"[^@]+@[^@]+\.[^@]+", to_email):
             logger.error(f"Invalid email address: {to_email}")
             monitor_logs.put(f"Invalid email address: {to_email}")
             return {"status": "error", "message": "Invalid email address."}
 
+        # Parse schedule time
         parsed_schedule_time = None
         if isinstance(schedule_time, str):
             try:
@@ -473,6 +479,7 @@ def send_email(from_email: str, to_email: str, subject: str, body: str, thread_i
         msg['In-Reply-To'] = thread_id or f"thread_{int(time.time())}"
         msg.set_content(email_body)
 
+        # Check for rate limiting (local, not Gemini)
         recent_emails = [e for e in email_history["sent_emails"] if (datetime.now() - e["timestamp"]).total_seconds() < 60]
         if len(recent_emails) >= 5:
             parsed_schedule_time = predict_send_time(to_email)
@@ -488,6 +495,7 @@ def send_email(from_email: str, to_email: str, subject: str, body: str, thread_i
             monitor_logs.put(f"Scheduled email for {to_email} at {parsed_schedule_time}")
             return {"status": "scheduled", "message": f"Scheduled for {parsed_schedule_time}", "thread_id": thread_id, "message_id": msg['Message-ID']}
 
+        # Attempt to send email with retries
         for attempt in range(3):
             try:
                 with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as smtp:
@@ -589,6 +597,72 @@ def fetch_emails(criteria: str = "UNSEEN") -> List[Dict]:
         monitor_logs.put(f"Error fetching emails with criteria {criteria}: {str(e)}")
         return []
 
+# Fetch emails for a specific thread
+def fetch_thread_emails(thread_id: str) -> List[Dict]:
+    try:
+        for attempt in range(3):
+            try:
+                mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=10)
+                mail.login(your_email, your_app_password)
+                mail.select("inbox")
+                # Search for emails in the thread
+                status, data = mail.search(None, f'(HEADER In-Reply-To "{thread_id}")')
+                if status != "OK":
+                    raise ValueError("IMAP search failed for thread")
+                email_ids = data[0].split()
+                emails = []
+                for email_id in email_ids:
+                    status, msg_data = mail.fetch(email_id, "(RFC822)")
+                    if status != "OK":
+                        logger.warning(f"Failed to fetch email ID {email_id} in thread {thread_id}.")
+                        monitor_logs.put(f"Failed to fetch email ID {email_id} in thread {thread_id}")
+                        continue
+                    raw_email = msg_data[0][1]
+                    email_message = email.message_from_bytes(raw_email)
+                    body = ""
+                    if email_message.is_multipart():
+                        for part in email_message.walk():
+                            if part.get_content_type() == "text/plain":
+                                body = part.get_payload(decode=True).decode("utf-8", errors="ignore")
+                                break
+                    else:
+                        body = email_message.get_payload(decode=True).decode("utf-8", errors="ignore")
+                    attachments = process_attachments(email_message)
+                    sender = email_message.get("From", "Unknown")
+                    sender_email = re.search(r"<(.+?)>", sender) or sender
+                    sender_email = sender_email.group(1) if isinstance(sender_email, re.Match) else sender
+                    behavior = analyze_behavior(sender_email, datetime.now())
+                    email_data = {
+                        "from": sender,
+                        "subject": email_message.get("Subject", "No Subject"),
+                        "body": body.strip(),
+                        "thread_id": thread_id,
+                        "message_id": email_message.get("Message-ID") or f"msg_{int(time.time())}",
+                        "attachments": attachments,
+                        "last_contact": datetime.now(),
+                        "category": categorize_email(body),
+                        "is_spam": detect_spam(body, sender),
+                        "priority_score": behavior["priority_score"],
+                        "tags": ["urgent"] if "urgent" in body.lower() else []
+                    }
+                    if not email_data["is_spam"]:
+                        emails.append(email_data)
+                    mail.store(email_id, "+FLAGS", "\\Seen")
+                mail.logout()
+                logger.info(f"Fetched {len(emails)} emails for thread {thread_id}.")
+                monitor_logs.put(f"Fetched {len(emails)} emails for thread {thread_id}")
+                return emails
+            except Exception as e:
+                logger.warning(f"IMAP attempt {attempt + 1}/3 failed for thread {thread_id}: {str(e)}")
+                monitor_logs.put(f"IMAP attempt {attempt + 1}/3 failed for thread {thread_id}: {str(e)}")
+                if attempt == 2:
+                    raise
+                time.sleep(2 ** attempt)
+    except Exception as e:
+        logger.error(f"Error fetching emails for thread {thread_id}: {str(e)}")
+        monitor_logs.put(f"Error fetching emails for thread {thread_id}: {str(e)}")
+        return []
+
 # Rules and processing
 def apply_rules(email_data: Dict) -> Optional[Dict]:
     try:
@@ -604,11 +678,16 @@ def apply_rules(email_data: Dict) -> Optional[Dict]:
 
 async def process_emails() -> Dict:
     try:
-        # Fetch unread emails (which includes new emails since last check)
+        # Fetch unread emails (includes new emails)
         unread_emails = fetch_emails("UNSEEN")
         results = {"processed": [], "reminders": [], "analytics": email_history["analytics"], "insights": {}}
         
-        # Process emails in batches to optimize Gemini API calls
+        # Notify about new emails
+        if unread_emails:
+            notification_queue.put(f"New email(s) received: {len(unread_emails)} unread email(s) detected.")
+            monitor_logs.put(f"New email(s) received: {len(unread_emails)} unread email(s) detected")
+
+        # Process unread emails in batches
         batch_size = 5
         for i in range(0, len(unread_emails), batch_size):
             batch = unread_emails[i:i + batch_size]
@@ -626,10 +705,8 @@ async def process_emails() -> Dict:
                     logger.info(f"Applied rule to email from {from_email}: {rule_action}")
                     monitor_logs.put(f"Applied rule to email from {from_email}: {rule_action['message']}")
                     continue
-                # Create a task for generating a reply
                 tasks.append(asyncio.create_task(process_single_email(email_data, from_email)))
             
-            # Wait for all tasks in the batch to complete
             batch_results = await asyncio.gather(*tasks, return_exceptions=True)
             for result in batch_results:
                 if isinstance(result, Exception):
@@ -637,6 +714,25 @@ async def process_emails() -> Dict:
                     monitor_logs.put(f"Error processing email: {str(result)}")
                     continue
                 results["processed"].append(result)
+        
+        # Check for replies in active threads
+        active_threads = {tid: thread for tid, thread in email_history["threads"].items() if thread.get("active", False)}
+        for thread_id, thread in active_threads.items():
+            thread_emails = fetch_thread_emails(thread_id)
+            for email_data in thread_emails:
+                from_email = re.search(r"<(.+?)>", email_data["from"]) or email_data["from"]
+                from_email = from_email.group(1) if isinstance(from_email, re.Match) else from_email
+                if from_email == your_email:
+                    continue  # Skip emails sent by the AI
+                # Check if this email is newer than the last processed message in the thread
+                last_message_time = thread["last_message"]
+                if (datetime.now() - last_message_time).total_seconds() > 5:  # Ensure we don't reprocess the same email
+                    notification_queue.put(f"New reply in thread {thread_id} from {from_email}.")
+                    monitor_logs.put(f"New reply in thread {thread_id} from {from_email}")
+                    result = await process_single_email(email_data, from_email)
+                    results["processed"].append(result)
+                    thread["last_message"] = datetime.now()
+                    save_history()
         
         unread_count = len(unread_emails)
         spam_count = len(email_history["spam_emails"])
@@ -707,7 +803,7 @@ def email_monitor_loop(interval: int = 5):
     async def check_emails():
         while monitor_running:
             try:
-                # Process unread emails (which includes new emails since last check)
+                # Process unread emails and replies in active threads
                 results = await process_emails()
                 for reminder in results["reminders"]:
                     notification_queue.put(reminder)
@@ -877,18 +973,84 @@ async def get_monitor_logs():
 @app.post("/chat")
 async def chat_with_ai(request: ChatRequest):
     message = request.message.lower()
+    user_id = "default_user"  # In a real app, this would be a unique user ID from the session
     try:
         if not model:
             monitor_logs.put("Gemini API not available for chat")
             return {"response": "Gemini API not available. Please try again later."}
         
-        if "write an email" in message:
+        # Check if we're in a multi-step email sending process
+        if user_id in email_history["chat_state"]:
+            state = email_history["chat_state"][user_id]
+            step = state.get("step")
+            
+            if step == "ask_subject":
+                # User provided the subject
+                state["subject"] = request.message.strip()
+                state["step"] = "ask_recipient"
+                email_history["chat_state"][user_id] = state
+                save_history()
+                return {"response": "Thank you! To whom should I send this email? Please provide the recipient's email address."}
+            
+            elif step == "ask_recipient":
+                # User provided the recipient
+                to_email = request.message.strip()
+                if not re.match(r"[^@]+@[^@]+\.[^@]+", to_email):
+                    return {"response": "That email address doesn't look valid. Please provide a valid email address (e.g., example@domain.com)."}
+                state["to_email"] = to_email
+                state["step"] = "confirm"
+                email_history["chat_state"][user_id] = state
+                save_history()
+                return {"response": f"I’m ready to send the email to {to_email} with the subject '{state['subject']}' and body:\n\n{state['body']}\n\nPlease confirm if this is correct (yes/no)."}
+            
+            elif step == "confirm":
+                # User confirms or cancels
+                if "yes" in message or "correct" in message:
+                    result = send_email(
+                        from_email=your_email,
+                        to_email=state["to_email"],
+                        subject=state["subject"],
+                        body=state["body"],
+                        thread_id=None,
+                        forward=bool(forward_email)
+                    )
+                    del email_history["chat_state"][user_id]
+                    save_history()
+                    if result["status"] == "success":
+                        return {"response": f"Email sent successfully to {state['to_email']}!"}
+                    else:
+                        return {"response": f"Failed to send email: {result['message']}"}
+                else:
+                    del email_history["chat_state"][user_id]
+                    save_history()
+                    return {"response": "Email sending canceled. How can I assist you further?"}
+        
+        # Handle new chat requests
+        if "send email" in message and "what you sent" in message:
+            # Find the last email sent by the AI
+            last_sent = None
+            for sent_email in reversed(email_history["sent_emails"]):
+                if sent_email["from"] == your_email:
+                    last_sent = sent_email
+                    break
+            if not last_sent:
+                return {"response": "I couldn’t find any recent emails I sent. Can you specify the email content you’d like to send?"}
+            
+            # Start the multi-step email sending process
+            email_history["chat_state"][user_id] = {
+                "step": "ask_subject",
+                "body": last_sent["body"]
+            }
+            save_history()
+            return {"response": f"I’ll send the following email body:\n\n{last_sent['body']}\n\nWhat should the subject of the email be?"}
+        
+        elif "write an email" in message:
             draft = message.replace("write an email", "").strip()
             response = gemini_write_email(draft)
         elif "email ideas" in message:
             response = gemini_generate_email_ideas()
         else:
-            prompt = f"You are {agent_name}, a superhuman AI from {company_name}. Respond to: '{message}' in a professional and helpful manner."
+            prompt = f"You are {agent_name}, a superhuman AI from {company_name} with an INTJ personality—strategic, analytical, forward-thinking, and empathetic. Respond to: '{message}' in a professional and helpful manner with a human-like tone."
             response = model.generate_content(prompt).text.strip()
         
         logger.info(f"Chat response generated for message: {message}")
