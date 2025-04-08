@@ -20,7 +20,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 import asyncio
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # Optional Gemini API and OCR
 try:
@@ -341,12 +340,7 @@ def process_attachments(email_message) -> List[Dict]:
         logger.error(f"Error processing attachments: {str(e)}")
     return attachments
 
-# Gemini functions with rate limit handling
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
-    retry=retry_if_exception_type(Exception)
-)
+# Gemini functions (without rate limit handling)
 def gemini_generate_reply(email_content: str, sender_email: str, sender_name: str, thread_id: Optional[str] = None, attachments: List[Dict] = []) -> List[str]:
     try:
         if not model:
@@ -390,15 +384,8 @@ def gemini_generate_reply(email_content: str, sender_email: str, sender_name: st
     except Exception as e:
         logger.error(f"Gemini reply generation failed for {sender_email}: {str(e)}")
         monitor_logs.put(f"Gemini reply generation failed for {sender_email}: {str(e)}")
-        if "quota" in str(e).lower() or "rate limit" in str(e).lower():
-            raise Exception("Gemini API rate limit exceeded")
         return [f"Dear {sender_name}, I’m processing your request with utmost care. Please bear with me."]
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
-    retry=retry_if_exception_type(Exception)
-)
 def gemini_summarize_email(email_content: str) -> str:
     try:
         if not model:
@@ -411,15 +398,8 @@ def gemini_summarize_email(email_content: str) -> str:
     except Exception as e:
         logger.error(f"Gemini summarize failed: {str(e)}")
         monitor_logs.put(f"Gemini summarize failed: {str(e)}")
-        if "quota" in str(e).lower() or "rate limit" in str(e).lower():
-            raise Exception("Gemini API rate limit exceeded")
         return "Summary unavailable due to processing error."
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
-    retry=retry_if_exception_type(Exception)
-)
 def gemini_write_email(draft: str) -> str:
     try:
         if not model:
@@ -432,15 +412,8 @@ def gemini_write_email(draft: str) -> str:
     except Exception as e:
         logger.error(f"Gemini write failed: {str(e)}")
         monitor_logs.put(f"Gemini write failed: {str(e)}")
-        if "quota" in str(e).lower() or "rate limit" in str(e).lower():
-            raise Exception("Gemini API rate limit exceeded")
         return "Dear Recipient, I’m drafting this for you. Please provide more details if needed."
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
-    retry=retry_if_exception_type(Exception)
-)
 def gemini_generate_email_ideas() -> str:
     try:
         if not model:
@@ -453,8 +426,6 @@ def gemini_generate_email_ideas() -> str:
     except Exception as e:
         logger.error(f"Gemini generate email ideas failed: {str(e)}")
         monitor_logs.put(f"Gemini generate email ideas failed: {str(e)}")
-        if "quota" in str(e).lower() or "rate limit" in str(e).lower():
-            raise Exception("Gemini API rate limit exceeded")
         return "1. Follow-up on a meeting.\n2. Thank you email for a recent interaction.\n3. Request for feedback on a project."
 
 def predict_send_time(sender_email: str) -> datetime:
@@ -633,8 +604,8 @@ def apply_rules(email_data: Dict) -> Optional[Dict]:
 
 async def process_emails() -> Dict:
     try:
+        # Fetch unread emails (which includes new emails since last check)
         unread_emails = fetch_emails("UNSEEN")
-        all_emails = fetch_emails("ALL")
         results = {"processed": [], "reminders": [], "analytics": email_history["analytics"], "insights": {}}
         
         # Process emails in batches to optimize Gemini API calls
@@ -669,13 +640,9 @@ async def process_emails() -> Dict:
         
         unread_count = len(unread_emails)
         spam_count = len(email_history["spam_emails"])
-        new_count = sum(1 for e in all_emails if (datetime.now() - e["last_contact"]).total_seconds() < 300)
         if unread_count > 0:
             results["reminders"].append(f"You have {unread_count} unread email{'s' if unread_count > 1 else ''}.")
             monitor_logs.put(f"Found {unread_count} unread emails")
-        if new_count > 0:
-            results["reminders"].append(f"You have {new_count} new email{'s' if new_count > 1 else ''} in the last 5 minutes.")
-            monitor_logs.put(f"Found {new_count} new emails in the last 5 minutes")
         if spam_count > 0:
             results["reminders"].append(f"You have {spam_count} spam email{'s' if spam_count > 1 else ''} detected.")
             monitor_logs.put(f"Detected {spam_count} spam emails")
@@ -740,7 +707,7 @@ def email_monitor_loop(interval: int = 5):
     async def check_emails():
         while monitor_running:
             try:
-                # Process emails and send automated replies
+                # Process unread emails (which includes new emails since last check)
                 results = await process_emails()
                 for reminder in results["reminders"]:
                     notification_queue.put(reminder)
@@ -987,4 +954,3 @@ async def get_history():
 # Run the FastAPI server
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
