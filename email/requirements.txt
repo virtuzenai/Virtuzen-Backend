@@ -5,3 +5,4 @@ google-generativeai==0.8.2
 pytesseract==0.3.10
 Pillow==10.4.0
 tenacity
+pytz
