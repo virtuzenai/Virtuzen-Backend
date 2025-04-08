@@ -1,4 +1,9 @@
-fastapi>=0.95.0
-uvicorn>=0.20.0
-google-generativeai>=0.3.0
-Pillow>=9.0.0
+fastapi==0.115.0
+uvicorn==0.30.6
+pydantic==2.9.2
+imaplib2==3.6  # For IMAP operations (alternative to imaplib if needed)
+smtplib  # Built-in, no need to install
+email  # Built-in, no need to install
+google-generativeai==0.8.2  # For Gemini API (optional)
+pytesseract==0.3.10  # For OCR (optional)
+Pillow==10.4.0  # For image processing (optional)
