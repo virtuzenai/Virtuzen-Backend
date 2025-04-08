@@ -761,7 +761,7 @@ async def chat_with_ai(request: ChatRequest):
         if "write an email" in message:
             draft = message.replace("write an email", "").strip()
             response = gemini_write_email(draft)
-                   elif "email ideas" in message:
+        elif "email ideas" in message:
             response = gemini_generate_email_ideas()
         else:
             prompt = f"You are {agent_name}, a superhuman AI from {company_name}. Respond to: '{message}' in a professional and helpful manner."
