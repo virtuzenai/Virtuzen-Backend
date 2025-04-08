@@ -52,12 +52,12 @@ agent_name = ""
 forward_email = ""
 
 # Gemini API setup
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyC4B45yRMZO2VVMzGYtLh-uW49Us0W-Ix8")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 model = None
 if genai:
     try:
         genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model = genai.GenerativeModel('gemini-2.0-flash')
         logger.info("Gemini API initialized successfully.")
     except Exception as e:
         logger.error(f"Failed to initialize Gemini API: {str(e)}")
@@ -987,3 +987,4 @@ async def get_history():
 # Run the FastAPI server
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
