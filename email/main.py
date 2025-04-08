@@ -16,6 +16,7 @@ import queue
 import hashlib
 from collections import defaultdict
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware  # Add CORS middleware
 from pydantic import BaseModel
 import uvicorn
 
@@ -636,6 +637,15 @@ def email_monitor_loop(interval: int = 5):
 
 # FastAPI setup
 app = FastAPI(title="Email Automation Server")
+
+# Add CORS middleware to allow frontend requests
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, specify your frontend URL (e.g., "https://swa-email-frontend.netlify.app")
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Pydantic models for API requests
 class EmailRequest(BaseModel):
