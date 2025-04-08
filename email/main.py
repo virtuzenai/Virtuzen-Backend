@@ -16,7 +16,7 @@ import queue
 import hashlib
 from collections import defaultdict
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware  # Add CORS middleware
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 
@@ -322,7 +322,6 @@ def process_attachments(email_message) -> List[Dict]:
                 logger.warning(f"Attachment {filename} exceeds 5MB, skipping.")
                 continue
             attachment = {"filename": filename, "data": base64.b64encode(data).decode('utf-8')}
-            # Check if OCR is available
             if pytesseract and Image and BytesIO and filename.lower().endswith(('.png', '.jpg', '.jpeg')):
                 try:
                     img = Image.open(BytesIO(data))
@@ -407,6 +406,24 @@ def gemini_write_email(draft: str) -> str:
         logger.error(f"Gemini write failed: {str(e)}")
         return "Dear Recipient, I’m drafting this for you. Please provide more details if needed."
 
+def gemini_evaluate_email(email_content: str) -> str:
+    try:
+        if not model:
+            logger.warning("Gemini API not available, returning basic evaluation.")
+            return "Evaluation: Tone is neutral, sentiment is neutral."
+        tone = detect_tone(email_content)
+        sentiment = detect_sentiment(email_content)
+        prompt = (
+            f"Evaluate this email content: '{email_content}'.\n"
+            f"Detected tone: {tone}\nDetected sentiment: {sentiment}\n"
+            f"Provide a concise evaluation (1-2 sentences) on its tone, clarity, professionalism, and any suggestions for improvement."
+        )
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        logger.error(f"Gemini evaluate failed: {str(e)}")
+        return "Evaluation unavailable due to processing error."
+
 def predict_send_time(sender_email: str) -> datetime:
     try:
         if sender_email in email_history["contacts"]:
@@ -422,15 +439,13 @@ def predict_send_time(sender_email: str) -> datetime:
         logger.error(f"Error predicting send time for {sender_email}: {str(e)}")
         return datetime.now() + timedelta(hours=1)
 
-# Email sending function with fixed schedule_time parsing
+# Email sending function
 def send_email(from_email: str, to_email: str, subject: str, body: str, thread_id: Optional[str] = None, message_id: Optional[str] = None, schedule_time: Optional[Union[datetime, str]] = None, forward: bool = False, attachments: List[Dict] = []) -> Dict:
     try:
-        # Validate email address
         if not re.match(r"[^@]+@[^@]+\.[^@]+", to_email):
             logger.error(f"Invalid email address: {to_email}")
             return {"status": "error", "message": "Invalid email address."}
 
-        # Parse schedule_time if it's a string
         parsed_schedule_time = None
         if isinstance(schedule_time, str):
             try:
@@ -638,10 +653,10 @@ def email_monitor_loop(interval: int = 5):
 # FastAPI setup
 app = FastAPI(title="Email Automation Server")
 
-# Add CORS middleware to allow frontend requests
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify your frontend URL (e.g., "https://swa-email-frontend.netlify.app")
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -653,7 +668,15 @@ class EmailRequest(BaseModel):
     subject: str
     body: str
     thread_id: Optional[str] = None
-    schedule_time: Optional[str] = None  # ISO format: "2025-04-08T12:00:00"
+    schedule_time: Optional[str] = None
+
+class AIRequest(BaseModel):
+    input: str
+
+class AISendRequest(BaseModel):
+    to_email: str
+    subject: str
+    body: str
 
 @app.on_event("startup")
 async def startup_event():
@@ -698,6 +721,57 @@ async def api_get_notifications():
 @app.get("/history")
 async def api_get_history():
     return email_history
+
+# AI Command Endpoints
+@app.post("/ai/generate")
+async def ai_generate(request: AIRequest):
+    try:
+        result = gemini_write_email(request.input)
+        return {"result": result}
+    except Exception as e:
+        logger.error(f"AI generate failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate email: {str(e)}")
+
+@app.post("/ai/summarize")
+async def ai_summarize(request: AIRequest):
+    try:
+        result = gemini_summarize_email(request.input)
+        return {"result": result}
+    except Exception as e:
+        logger.error(f"AI summarize failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to summarize email: {str(e)}")
+
+@app.post("/ai/revise")
+async def ai_revise(request: AIRequest):
+    try:
+        result = gemini_revise_email(request.input)
+        return {"result": result}
+    except Exception as e:
+        logger.error(f"AI revise failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to revise email: {str(e)}")
+
+@app.post("/ai/evaluate")
+async def ai_evaluate(request: AIRequest):
+    try:
+        result = gemini_evaluate_email(request.input)
+        return {"result": result}
+    except Exception as e:
+        logger.error(f"AI evaluate failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to evaluate email: {str(e)}")
+
+@app.post("/ai/send")
+async def ai_send(request: AISendRequest):
+    try:
+        result = send_email(
+            from_email=your_email,
+            to_email=request.to_email,
+            subject=request.subject,
+            body=request.body
+        )
+        return result
+    except Exception as e:
+        logger.error(f"AI send failed for {request.to_email}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to send email: {str(e)}")
 
 if __name__ == "__main__":
     email_history["rules"]["urgent_forward"] = {
