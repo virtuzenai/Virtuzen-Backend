@@ -30,11 +30,13 @@ try:
     from io import BytesIO
 except ImportError:
     pytesseract = None
+    Image = None
+    BytesIO = None
 
-# Setup logging
+# Setup logging with more detail
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s - %(funcName)s:%(lineno)d',
+    format='%(asctime)s - %(levelname)s - %(message)s - %(funcName)s:%(lineno)d - %(process)d',
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
@@ -84,7 +86,7 @@ email_history = {
     "tags": defaultdict(list)
 }
 
-# Load and save history functions (unchanged from previous version)
+# Load and save history functions
 def load_history():
     global email_history
     try:
@@ -139,7 +141,7 @@ def save_history():
 
 load_history()
 
-# Tone, spam, sentiment, and category keywords (unchanged)
+# Tone, spam, sentiment, and category keywords
 TONE_KEYWORDS = {
     "happy": ["great", "awesome", "happy", "thanks", "excited", "cool", "wonderful", "yay"],
     "urgent": ["urgent", "now", "immediately", "asap", "quick", "hurry", "emergency"],
@@ -160,16 +162,21 @@ CATEGORY_KEYWORDS = {
 EMAIL_HEADER = f"\n{company_name}\n----------------------------------------"
 EMAIL_FOOTER = f"----------------------------------------\nBest regards,\n{agent_name}\n{company_name}"
 
-# Utility functions (unchanged)
+# Utility functions
 def extract_sender_name(email_from: str) -> str:
     try:
         match = re.search(r"(\w+)\s*(\w+)?", email_from.split('@')[0])
         return match.group(1).capitalize() if match else "Friend"
-    except Exception:
+    except Exception as e:
+        logger.error(f"Error extracting sender name from {email_from}: {str(e)}")
         return "Friend"
 
 def clean_header_value(value: str) -> str:
-    return value.replace("\n", "").replace("\r", "") if value else ""
+    try:
+        return value.replace("\n", "").replace("\r", "") if value else ""
+    except Exception as e:
+        logger.error(f"Error cleaning header value: {str(e)}")
+        return ""
 
 def detect_tone(email_content: str) -> str:
     try:
@@ -178,7 +185,8 @@ def detect_tone(email_content: str) -> str:
         for tone, keywords in TONE_KEYWORDS.items():
             scores[tone] = sum(1 for kw in keywords if kw in content_lower)
         return max(scores, key=scores.get, default="neutral")
-    except Exception:
+    except Exception as e:
+        logger.error(f"Error detecting tone: {str(e)}")
         return "neutral"
 
 def detect_sentiment(email_content: str) -> str:
@@ -188,7 +196,8 @@ def detect_sentiment(email_content: str) -> str:
         for sentiment, keywords in SENTIMENT_KEYWORDS.items():
             scores[sentiment] = sum(1 for kw in keywords if kw in content_lower)
         return max(scores, key=scores.get, default="neutral")
-    except Exception:
+    except Exception as e:
+        logger.error(f"Error detecting sentiment: {str(e)}")
         return "neutral"
 
 def detect_language(email_content: str) -> str:
@@ -199,7 +208,8 @@ def detect_language(email_content: str) -> str:
         elif any(word in content_lower for word in ["bonjour", "merci"]):
             return "French"
         return "English"
-    except Exception:
+    except Exception as e:
+        logger.error(f"Error detecting language: {str(e)}")
         return "English"
 
 def detect_spam(email_content: str, sender: str) -> bool:
@@ -211,7 +221,8 @@ def detect_spam(email_content: str, sender: str) -> bool:
             response = model.generate_content(prompt)
             return response.text.strip().lower() == "yes"
         return spam_score > 2 or "unsubscribe" in content_lower
-    except Exception:
+    except Exception as e:
+        logger.error(f"Error detecting spam: {str(e)}")
         return False
 
 def categorize_email(email_content: str) -> str:
@@ -226,7 +237,8 @@ def categorize_email(email_content: str) -> str:
             response = model.generate_content(prompt)
             category = response.text.strip().lower()
         return category
-    except Exception:
+    except Exception as e:
+        logger.error(f"Error categorizing email: {str(e)}")
         return "general"
 
 def analyze_behavior(sender_email: str, current_time: datetime) -> Dict:
@@ -246,7 +258,8 @@ def analyze_behavior(sender_email: str, current_time: datetime) -> Dict:
             "priority_score": priority_score,
             "sentiment": detect_sentiment(" ".join([msg["content"] for msg in info["conversation_history"]]))
         }
-    except Exception:
+    except Exception as e:
+        logger.error(f"Error analyzing behavior for {sender_email}: {str(e)}")
         return {"frequency": "new", "avg_response_time": 0, "tone": "neutral", "context": {}, "priority_score": 0, "sentiment": "neutral"}
 
 def update_context(sender_email: str, email_content: str, attachments: List[Dict] = []) -> None:
@@ -288,38 +301,50 @@ def update_context(sender_email: str, email_content: str, attachments: List[Dict
         for tag in info["tags"]:
             email_history["tags"][tag].append(info["conversation_history"][-1]["message_id"] if "message_id" in info["conversation_history"][-1] else hashlib.md5(email_content.encode()).hexdigest())
     except Exception as e:
-        logger.error(f"Error updating context: {str(e)}")
+        logger.error(f"Error updating context for {sender_email}: {str(e)}")
 
 def process_attachments(email_message) -> List[Dict]:
     attachments = []
     try:
-        if email_message.is_multipart():
-            for part in email_message.walk():
-                if part.get_content_maintype() == 'multipart':
-                    continue
-                if part.get('Content-Disposition') is None:
-                    continue
-                filename = part.get_filename()
-                if filename:
-                    data = part.get_payload(decode=True)
-                    if len(data) > 5 * 1024 * 1024:
-                        logger.warning(f"Attachment {filename} exceeds 5MB, skipping.")
-                        continue
-                    attachment = {"filename": filename, "data": base64.b64encode(data).decode('utf-8')}
-                    if pytesseract and filename.lower().endswith(('.png', '.jpg', '.jpeg')):
-                        img = Image.open(BytesIO(data))
-                        text = pytesseract.image_to_string(img)
-                        attachment["ocr_text"] = text
-                    attachments.append(attachment)
+        if not email_message.is_multipart():
+            return attachments
+        for part in email_message.walk():
+            if part.get_content_maintype() == 'multipart':
+                continue
+            if part.get('Content-Disposition') is None:
+                continue
+            filename = part.get_filename()
+            if not filename:
+                continue
+            data = part.get_payload(decode=True)
+            if len(data) > 5 * 1024 * 1024:  # 5MB limit
+                logger.warning(f"Attachment {filename} exceeds 5MB, skipping.")
+                continue
+            attachment = {"filename": filename, "data": base64.b64encode(data).decode('utf-8')}
+            # Check if OCR is available
+            if pytesseract and Image and BytesIO and filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+                try:
+                    img = Image.open(BytesIO(data))
+                    text = pytesseract.image_to_string(img)
+                    attachment["ocr_text"] = text
+                    logger.info(f"Successfully processed OCR for attachment {filename}.")
+                except Exception as e:
+                    logger.error(f"Error processing OCR for attachment {filename}: {str(e)}")
+                    attachment["ocr_text"] = "OCR failed due to processing error."
+            else:
+                logger.info(f"Skipping OCR for {filename}: Tesseract or required libraries not available.")
+                attachment["ocr_text"] = "OCR not available."
+            attachments.append(attachment)
     except Exception as e:
         logger.error(f"Error processing attachments: {str(e)}")
     return attachments
 
-# Gemini functions (unchanged)
+# Gemini functions
 def gemini_generate_reply(email_content: str, sender_email: str, sender_name: str, thread_id: Optional[str] = None, attachments: List[Dict] = []) -> List[str]:
     try:
         if not model:
-            raise ValueError("Gemini API not available.")
+            logger.warning("Gemini API not available, falling back to default reply.")
+            return [f"Dear {sender_name}, I’m processing your request with utmost care. Please bear with me."]
         tone = detect_tone(email_content)
         sentiment = detect_sentiment(email_content)
         language = detect_language(email_content)
@@ -342,13 +367,14 @@ def gemini_generate_reply(email_content: str, sender_email: str, sender_name: st
         replies = response.text.strip().split("\n\n")
         return replies[:3] if len(replies) >= 3 else [replies[0]] * 3 if replies else ["Default reply"]
     except Exception as e:
-        logger.error(f"Gemini reply generation failed: {str(e)}")
+        logger.error(f"Gemini reply generation failed for {sender_email}: {str(e)}")
         return [f"Dear {sender_name}, I’m processing your request with utmost care. Please bear with me."]
 
 def gemini_summarize_email(email_content: str) -> str:
     try:
         if not model:
-            raise ValueError("Gemini API not available.")
+            logger.warning("Gemini API not available, falling back to basic summary.")
+            return " ".join(email_content.split()[:20]) + "..."
         prompt = f"Summarize this email in 1-2 sentences: '{email_content}'"
         response = model.generate_content(prompt)
         return response.text.strip()
@@ -359,7 +385,8 @@ def gemini_summarize_email(email_content: str) -> str:
 def gemini_revise_email(draft: str) -> str:
     try:
         if not model:
-            raise ValueError("Gemini API not available.")
+            logger.warning("Gemini API not available, returning original draft.")
+            return draft
         prompt = f"Revise this email draft for clarity, professionalism, and conciseness (2-4 sentences): '{draft}'. Do not include a subject line in the body."
         response = model.generate_content(prompt)
         return response.text.strip()
@@ -370,7 +397,8 @@ def gemini_revise_email(draft: str) -> str:
 def gemini_write_email(draft: str) -> str:
     try:
         if not model:
-            raise ValueError("Gemini API not available.")
+            logger.warning("Gemini API not available, falling back to default draft.")
+            return "Dear Recipient, I’m drafting this for you. Please provide more details if needed."
         prompt = f"Write a professional email draft (2-4 sentences) based on: '{draft}'. Do not include a subject line in the body."
         response = model.generate_content(prompt)
         return response.text.strip()
@@ -389,12 +417,29 @@ def predict_send_time(sender_email: str) -> datetime:
                 scheduled = now.replace(hour=avg_hour, minute=0, second=0)
                 return scheduled + timedelta(days=1) if now.hour > avg_hour else scheduled
         return datetime.now() + timedelta(hours=1)
-    except Exception:
+    except Exception as e:
+        logger.error(f"Error predicting send time for {sender_email}: {str(e)}")
         return datetime.now() + timedelta(hours=1)
 
-# Email sending function
-def send_email(from_email: str, to_email: str, subject: str, body: str, thread_id: Optional[str] = None, message_id: Optional[str] = None, schedule_time: Optional[datetime] = None, forward: bool = False, attachments: List[Dict] = []) -> Dict:
+# Email sending function with fixed schedule_time parsing
+def send_email(from_email: str, to_email: str, subject: str, body: str, thread_id: Optional[str] = None, message_id: Optional[str] = None, schedule_time: Optional[Union[datetime, str]] = None, forward: bool = False, attachments: List[Dict] = []) -> Dict:
     try:
+        # Validate email address
+        if not re.match(r"[^@]+@[^@]+\.[^@]+", to_email):
+            logger.error(f"Invalid email address: {to_email}")
+            return {"status": "error", "message": "Invalid email address."}
+
+        # Parse schedule_time if it's a string
+        parsed_schedule_time = None
+        if isinstance(schedule_time, str):
+            try:
+                parsed_schedule_time = datetime.fromisoformat(schedule_time)
+            except ValueError as e:
+                logger.error(f"Invalid schedule_time format: {schedule_time}. Expected ISO format (e.g., '2025-04-08T12:00:00'). Error: {str(e)}")
+                return {"status": "error", "message": f"Invalid schedule_time format: {str(e)}. Expected ISO format (e.g., '2025-04-08T12:00:00')."}
+        elif isinstance(schedule_time, datetime):
+            parsed_schedule_time = schedule_time
+
         sender_name = extract_sender_name(to_email)
         email_body = f"{EMAIL_HEADER}\n\nDear {sender_name},\n\n{body}\n\n{EMAIL_FOOTER}"
         
@@ -408,16 +453,16 @@ def send_email(from_email: str, to_email: str, subject: str, body: str, thread_i
 
         recent_emails = [e for e in email_history["sent_emails"] if (datetime.now() - e["timestamp"]).total_seconds() < 60]
         if len(recent_emails) >= 5:
-            schedule_time = predict_send_time(to_email)
-            logger.info(f"Rate limit hit, scheduling email for {schedule_time}.")
+            parsed_schedule_time = predict_send_time(to_email)
+            logger.info(f"Rate limit hit, scheduling email for {parsed_schedule_time} to {to_email}.")
 
-        if schedule_time:
+        if parsed_schedule_time and parsed_schedule_time > datetime.now():
             email_history["scheduled_emails"].append({
-                "to": to_email, "subject": subject, "body": email_body, "time": schedule_time,
+                "to": to_email, "subject": subject, "body": email_body, "time": parsed_schedule_time,
                 "thread_id": thread_id, "message_id": msg['Message-ID']
             })
             save_history()
-            return {"status": "scheduled", "message": f"Scheduled for {schedule_time}", "thread_id": thread_id, "message_id": msg['Message-ID']}
+            return {"status": "scheduled", "message": f"Scheduled for {parsed_schedule_time}", "thread_id": thread_id, "message_id": msg['Message-ID']}
 
         for attempt in range(3):
             try:
@@ -436,75 +481,83 @@ def send_email(from_email: str, to_email: str, subject: str, body: str, thread_i
                         "summary": gemini_summarize_email(body) if model else "Recent message"
                     }
                 save_history()
+                logger.info(f"Email sent successfully to {to_email} with subject '{subject}'.")
                 return {"status": "success", "message": "Email sent!", "thread_id": thread_id, "message_id": msg['Message-ID']}
             except Exception as e:
-                logger.warning(f"SMTP attempt {attempt + 1}/3: {str(e)}")
+                logger.warning(f"SMTP attempt {attempt + 1}/3 failed for {to_email}: {str(e)}")
                 if attempt == 2:
                     raise
                 time.sleep(2 ** attempt)
     except Exception as e:
-        logger.error(f"Error sending email: {str(e)}")
+        logger.error(f"Error sending email to {to_email}: {str(e)}")
         return {"status": "error", "message": str(e)}
 
 # Fetch emails
 def fetch_emails(criteria: str = "UNSEEN") -> List[Dict]:
-    for attempt in range(3):
-        try:
-            mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=10)
-            mail.login(your_email, your_app_password)
-            mail.select("inbox")
-            status, data = mail.search(None, criteria)
-            if status != "OK":
-                raise ValueError("IMAP search failed")
-            email_ids = data[0].split()
-            emails = []
-            for email_id in email_ids[-10:]:
-                status, msg_data = mail.fetch(email_id, "(RFC822)")
+    try:
+        for attempt in range(3):
+            try:
+                mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=10)
+                mail.login(your_email, your_app_password)
+                mail.select("inbox")
+                status, data = mail.search(None, criteria)
                 if status != "OK":
-                    continue
-                raw_email = msg_data[0][1]
-                email_message = email.message_from_bytes(raw_email)
-                body = ""
-                if email_message.is_multipart():
-                    for part in email_message.walk():
-                        if part.get_content_type() == "text/plain":
-                            body = part.get_payload(decode=True).decode("utf-8", errors="ignore")
-                            break
-                else:
-                    body = email_message.get_payload(decode=True).decode("utf-8", errors="ignore")
-                attachments = process_attachments(email_message)
-                sender = email_message.get("From", "Unknown")
-                sender_email = re.search(r"<(.+?)>", sender) or sender
-                sender_email = sender_email.group(1) if isinstance(sender_email, re.Match) else sender
-                behavior = analyze_behavior(sender_email, datetime.now())
-                email_data = {
-                    "from": sender,
-                    "subject": email_message.get("Subject", "No Subject"),
-                    "body": body.strip(),
-                    "thread_id": email_message.get("In-Reply-To") or f"thread_{int(time.time())}",
-                    "message_id": email_message.get("Message-ID") or f"msg_{int(time.time())}",
-                    "attachments": attachments,
-                    "last_contact": datetime.now(),
-                    "category": categorize_email(body),
-                    "is_spam": detect_spam(body, sender),
-                    "priority_score": behavior["priority_score"],
-                    "tags": ["urgent"] if "urgent" in body.lower() else []
-                }
-                if email_data["is_spam"]:
-                    email_history["spam_emails"].append(email_data)
-                else:
-                    emails.append(email_data)
-                    email_history["categories"][email_data["category"]] = email_history["categories"].get(email_data["category"], []) + [email_data["message_id"]]
-                if criteria == "UNSEEN":
-                    mail.store(email_id, "+FLAGS", "\\Seen")
-            mail.logout()
-            return sorted(emails, key=lambda x: x["priority_score"], reverse=True)
-        except Exception as e:
-            logger.warning(f"IMAP attempt {attempt + 1}/3: {str(e)}")
-            if attempt == 2:
-                return []
+                    raise ValueError("IMAP search failed")
+                email_ids = data[0].split()
+                emails = []
+                for email_id in email_ids[-10:]:
+                    status, msg_data = mail.fetch(email_id, "(RFC822)")
+                    if status != "OK":
+                        logger.warning(f"Failed to fetch email ID {email_id}.")
+                        continue
+                    raw_email = msg_data[0][1]
+                    email_message = email.message_from_bytes(raw_email)
+                    body = ""
+                    if email_message.is_multipart():
+                        for part in email_message.walk():
+                            if part.get_content_type() == "text/plain":
+                                body = part.get_payload(decode=True).decode("utf-8", errors="ignore")
+                                break
+                    else:
+                        body = email_message.get_payload(decode=True).decode("utf-8", errors="ignore")
+                    attachments = process_attachments(email_message)
+                    sender = email_message.get("From", "Unknown")
+                    sender_email = re.search(r"<(.+?)>", sender) or sender
+                    sender_email = sender_email.group(1) if isinstance(sender_email, re.Match) else sender
+                    behavior = analyze_behavior(sender_email, datetime.now())
+                    email_data = {
+                        "from": sender,
+                        "subject": email_message.get("Subject", "No Subject"),
+                        "body": body.strip(),
+                        "thread_id": email_message.get("In-Reply-To") or f"thread_{int(time.time())}",
+                        "message_id": email_message.get("Message-ID") or f"msg_{int(time.time())}",
+                        "attachments": attachments,
+                        "last_contact": datetime.now(),
+                        "category": categorize_email(body),
+                        "is_spam": detect_spam(body, sender),
+                        "priority_score": behavior["priority_score"],
+                        "tags": ["urgent"] if "urgent" in body.lower() else []
+                    }
+                    if email_data["is_spam"]:
+                        email_history["spam_emails"].append(email_data)
+                    else:
+                        emails.append(email_data)
+                        email_history["categories"][email_data["category"]] = email_history["categories"].get(email_data["category"], []) + [email_data["message_id"]]
+                    if criteria == "UNSEEN":
+                        mail.store(email_id, "+FLAGS", "\\Seen")
+                mail.logout()
+                logger.info(f"Fetched {len(emails)} emails with criteria {criteria}.")
+                return sorted(emails, key=lambda x: x["priority_score"], reverse=True)
+            except Exception as e:
+                logger.warning(f"IMAP attempt {attempt + 1}/3 failed: {str(e)}")
+                if attempt == 2:
+                    raise
+                time.sleep(2 ** attempt)
+    except Exception as e:
+        logger.error(f"Error fetching emails with criteria {criteria}: {str(e)}")
+        return []
 
-# Rules and processing (unchanged)
+# Rules and processing
 def apply_rules(email_data: Dict) -> Optional[Dict]:
     try:
         for rule_id, rule in email_history["rules"].items():
@@ -513,7 +566,7 @@ def apply_rules(email_data: Dict) -> Optional[Dict]:
                 return action(email_data)
         return None
     except Exception as e:
-        logger.error(f"Error applying rules: {str(e)}")
+        logger.error(f"Error applying rules to email from {email_data.get('from', 'unknown')}: {str(e)}")
         return None
 
 def process_emails() -> Dict:
@@ -524,16 +577,19 @@ def process_emails() -> Dict:
         
         for email_data in unread_emails:
             if email_data["is_spam"]:
+                logger.info(f"Skipping spam email from {email_data['from']}.")
                 continue
             from_email = re.search(r"<(.+?)>", email_data["from"]) or email_data["from"]
             from_email = from_email.group(1) if isinstance(from_email, re.Match) else from_email
             rule_action = apply_rules(email_data)
             if rule_action:
                 results["processed"].append(rule_action)
+                logger.info(f"Applied rule to email from {from_email}: {rule_action}")
                 continue
             replies = gemini_generate_reply(email_data["body"], from_email, extract_sender_name(from_email), email_data["thread_id"], email_data["attachments"]) if model else [email_history["templates"]["thanks"].format(name=extract_sender_name(from_email), company=company_name)]
             result = send_email(your_email, from_email, email_data["subject"], replies[0], email_data["thread_id"], email_data["message_id"], attachments=email_data["attachments"])
             results["processed"].append({"to": from_email, "subject": email_data["subject"], "reply": result, "options": replies[1:]})
+            logger.info(f"Processed email from {from_email}: {result['status']}")
         
         unread_count = len(unread_emails)
         spam_count = len(email_history["spam_emails"])
@@ -547,6 +603,7 @@ def process_emails() -> Dict:
         results["insights"]["top_contact"] = max(email_history["analytics"]["busiest_contacts"], key=email_history["analytics"]["busiest_contacts"].get, default="None")
         
         save_history()
+        logger.info("Email processing completed successfully.")
         return results
     except Exception as e:
         logger.error(f"Error processing emails: {str(e)}")
@@ -558,18 +615,21 @@ def email_monitor_loop(interval: int = 5):
     logger.info("Starting email monitor in background...")
     def check_emails():
         while True:
-            results = process_emails()
-            for reminder in results["reminders"]:
-                notification_queue.put(reminder)
-            for insight_key, insight_value in results["insights"].items():
-                notification_queue.put(f"Insight: {insight_key} = {insight_value}")
-            scheduled = email_history["scheduled_emails"][:]
-            for email in scheduled:
-                if datetime.now() >= email["time"]:
-                    send_result = send_email(your_email, email["to"], email["subject"], email["body"], email["thread_id"], email["message_id"])
-                    email_history["scheduled_emails"].remove(email)
-                    notification_queue.put(f"Scheduled email sent to {email['to']}: {send_result['message']}")
-            save_history()
+            try:
+                results = process_emails()
+                for reminder in results["reminders"]:
+                    notification_queue.put(reminder)
+                for insight_key, insight_value in results["insights"].items():
+                    notification_queue.put(f"Insight: {insight_key} = {insight_value}")
+                scheduled = email_history["scheduled_emails"][:]
+                for email in scheduled:
+                    if datetime.now() >= email["time"]:
+                        send_result = send_email(your_email, email["to"], email["subject"], email["body"], email["thread_id"], email["message_id"])
+                        email_history["scheduled_emails"].remove(email)
+                        notification_queue.put(f"Scheduled email sent to {email['to']}: {send_result['message']}")
+                save_history()
+            except Exception as e:
+                logger.error(f"Error in email monitor loop: {str(e)}")
             time.sleep(interval)
     
     threading.Thread(target=check_emails, daemon=True).start()
@@ -587,7 +647,7 @@ class EmailRequest(BaseModel):
 
 @app.on_event("startup")
 async def startup_event():
-    email_monitor_loop()  # Start background monitoring
+    email_monitor_loop()
 
 @app.get("/")
 async def root():
@@ -596,17 +656,17 @@ async def root():
 @app.post("/send-email")
 async def api_send_email(request: EmailRequest):
     try:
-        schedule_time = datetime.fromisoformat(request.schedule_time) if request.schedule_time else None
         result = send_email(
             from_email=your_email,
             to_email=request.to_email,
             subject=request.subject,
             body=request.body,
             thread_id=request.thread_id,
-            schedule_time=schedule_time
+            schedule_time=request.schedule_time
         )
         return result
     except Exception as e:
+        logger.error(f"API send-email failed for {request.to_email}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to send email: {str(e)}")
 
 @app.get("/fetch-emails")
@@ -615,6 +675,7 @@ async def api_fetch_emails(criteria: str = "UNSEEN"):
         emails = fetch_emails(criteria)
         return {"emails": emails}
     except Exception as e:
+        logger.error(f"API fetch-emails failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch emails: {str(e)}")
 
 @app.get("/notifications")
