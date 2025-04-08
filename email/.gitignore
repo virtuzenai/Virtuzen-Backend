@@ -1,0 +1,3 @@
+__pycache__
+*.pyc
+email_history.json  # Exclude if you don’t want history persisted between deploys
