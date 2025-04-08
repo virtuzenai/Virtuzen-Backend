@@ -20,7 +20,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 import asyncio
-import aiohttp
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # Optional Gemini API and OCR
@@ -680,8 +679,7 @@ async def process_emails() -> Dict:
         if spam_count > 0:
             results["reminders"].append(f"You have {spam_count} spam email{'s' if spam_count > 1 else ''} detected.")
             monitor_logs.put(f"Detected {spam_count} spam emails")
-        results["insights"]["top_contact"] = max(email_history["analytics"]["busiest_contacts"], key=email
-        results["analytics"]["busiest_contacts"].get, default="None")
+        results["insights"]["top_contact"] = max(email_history["analytics"]["busiest_contacts"], key=email_history["analytics"]["busiest_contacts"].get, default="None")
         
         save_history()
         logger.info("Email processing completed successfully.")
