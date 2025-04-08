@@ -42,13 +42,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Email credentials (use environment variables on Render)
-your_email = os.getenv("YOUR_EMAIL", "ivanlloydarig14@gmail.com")
-your_app_password = os.getenv("YOUR_APP_PASSWORD", "dsub gwvx pxfy tusj")
+# Email credentials (default values, will be updated by user)
+your_email = "ivanlloydarig14@gmail.com"
+your_app_password = "dsub gwvx pxfy tusj"
 test_recipient = "ivanlloydroquero18@gmail.com"
 company_name = "Workflow Solutions"
 agent_name = "Ivan"
-forward_email = os.getenv("FORWARD_EMAIL", "example@gmail.com")
+forward_email = "example@gmail.com"
 
 # Gemini API setup
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyC4B45yRMZO2VVMzGYtLh-uW49Us0W-Ix8")
@@ -382,18 +382,6 @@ def gemini_summarize_email(email_content: str) -> str:
         logger.error(f"Gemini summarize failed: {str(e)}")
         return "Summary unavailable due to processing error."
 
-def gemini_revise_email(draft: str) -> str:
-    try:
-        if not model:
-            logger.warning("Gemini API not available, returning original draft.")
-            return draft
-        prompt = f"Revise this email draft for clarity, professionalism, and conciseness (2-4 sentences): '{draft}'. Do not include a subject line in the body."
-        response = model.generate_content(prompt)
-        return response.text.strip()
-    except Exception as e:
-        logger.error(f"Gemini revise failed: {str(e)}")
-        return draft
-
 def gemini_write_email(draft: str) -> str:
     try:
         if not model:
@@ -406,23 +394,17 @@ def gemini_write_email(draft: str) -> str:
         logger.error(f"Gemini write failed: {str(e)}")
         return "Dear Recipient, I’m drafting this for you. Please provide more details if needed."
 
-def gemini_evaluate_email(email_content: str) -> str:
+def gemini_generate_email_ideas() -> str:
     try:
         if not model:
-            logger.warning("Gemini API not available, returning basic evaluation.")
-            return "Evaluation: Tone is neutral, sentiment is neutral."
-        tone = detect_tone(email_content)
-        sentiment = detect_sentiment(email_content)
-        prompt = (
-            f"Evaluate this email content: '{email_content}'.\n"
-            f"Detected tone: {tone}\nDetected sentiment: {sentiment}\n"
-            f"Provide a concise evaluation (1-2 sentences) on its tone, clarity, professionalism, and any suggestions for improvement."
-        )
+            logger.warning("Gemini API not available, returning default ideas.")
+            return "1. Follow-up on a meeting.\n2. Thank you email for a recent interaction.\n3. Request for feedback on a project."
+        prompt = "Generate 3 professional email ideas (1 sentence each) for a business context."
         response = model.generate_content(prompt)
         return response.text.strip()
     except Exception as e:
-        logger.error(f"Gemini evaluate failed: {str(e)}")
-        return "Evaluation unavailable due to processing error."
+        logger.error(f"Gemini generate email ideas failed: {str(e)}")
+        return "1. Follow-up on a meeting.\n2. Thank you email for a recent interaction.\n3. Request for feedback on a project."
 
 def predict_send_time(sender_email: str) -> datetime:
     try:
@@ -606,6 +588,7 @@ def process_emails() -> Dict:
             result = send_email(your_email, from_email, email_data["subject"], replies[0], email_data["thread_id"], email_data["message_id"], attachments=email_data["attachments"])
             results["processed"].append({"to": from_email, "subject": email_data["subject"], "reply": result, "options": replies[1:]})
             logger.info(f"Processed email from {from_email}: {result['status']}")
+            notification_queue.put(f"Replied to email from {from_email}: {result['message']}")
         
         unread_count = len(unread_emails)
         spam_count = len(email_history["spam_emails"])
@@ -627,10 +610,14 @@ def process_emails() -> Dict:
 
 # Background email monitoring
 notification_queue = queue.Queue()
+monitor_thread = None
+monitor_running = False
+
 def email_monitor_loop(interval: int = 5):
+    global monitor_running
     logger.info("Starting email monitor in background...")
     def check_emails():
-        while True:
+        while monitor_running:
             try:
                 results = process_emails()
                 for reminder in results["reminders"]:
@@ -648,7 +635,9 @@ def email_monitor_loop(interval: int = 5):
                 logger.error(f"Error in email monitor loop: {str(e)}")
             time.sleep(interval)
     
-    threading.Thread(target=check_emails, daemon=True).start()
+    global monitor_thread
+    monitor_thread = threading.Thread(target=check_emails, daemon=True)
+    monitor_thread.start()
 
 # FastAPI setup
 app = FastAPI(title="Email Automation Server")
@@ -670,21 +659,80 @@ class EmailRequest(BaseModel):
     thread_id: Optional[str] = None
     schedule_time: Optional[str] = None
 
-class AIRequest(BaseModel):
-    input: str
+class ChatRequest(BaseModel):
+    message: str
 
-class AISendRequest(BaseModel):
-    to_email: str
-    subject: str
-    body: str
-
-@app.on_event("startup")
-async def startup_event():
-    email_monitor_loop()
+class CredentialsRequest(BaseModel):
+    your_email: str
+    your_app_password: str
+    test_recipient: str
+    company_name: str
+    agent_name: str
+    forward_email: str
 
 @app.get("/")
 async def root():
     return {"message": "Email Automation Server is running. Use /docs for API details."}
+
+@app.post("/save-credentials")
+async def save_credentials(request: CredentialsRequest):
+    global your_email, your_app_password, test_recipient, company_name, agent_name, forward_email, EMAIL_HEADER, EMAIL_FOOTER
+    try:
+        your_email = request.your_email
+        your_app_password = request.your_app_password
+        test_recipient = request.test_recipient
+        company_name = request.company_name
+        agent_name = request.agent_name
+        forward_email = request.forward_email
+        EMAIL_HEADER = f"\n{company_name}\n----------------------------------------"
+        EMAIL_FOOTER = f"----------------------------------------\nBest regards,\n{agent_name}\n{company_name}"
+        logger.info("SMTP credentials updated successfully.")
+        return {"message": "Credentials saved successfully!"}
+    except Exception as e:
+        logger.error(f"Failed to save credentials: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to save credentials: {str(e)}")
+
+@app.post("/start-monitor")
+async def start_monitor():
+    global monitor_running
+    if monitor_running:
+        return {"message": "Monitor is already running."}
+    if not your_email or not your_app_password:
+        raise HTTPException(status_code=400, detail="SMTP credentials not set. Please save credentials first.")
+    monitor_running = True
+    email_monitor_loop()
+    return {"message": "Email monitor started."}
+
+@app.post("/stop-monitor")
+async def stop_monitor():
+    global monitor_running, monitor_thread
+    if not monitor_running:
+        return {"message": "Monitor is not running."}
+    monitor_running = False
+    if monitor_thread:
+        monitor_thread.join()
+    return {"message": "Email monitor stopped."}
+
+@app.post("/chat")
+async def chat_with_ai(request: ChatRequest):
+    message = request.message.lower()
+    try:
+        if "write an email" in message:
+            draft = message.replace("write an email", "").strip()
+            response = gemini_write_email(draft)
+            return {"response": f"Here's your email draft:\n\n{response}"}
+        elif "email ideas" in message:
+            ideas = gemini_generate_email_ideas()
+            return {"response": f"Here are some email ideas:\n\n{ideas}"}
+        elif "summarize" in message:
+            email_content = message.replace("summarize", "").strip()
+            summary = gemini_summarize_email(email_content)
+            return {"response": f"Summary:\n\n{summary}"}
+        else:
+            return {"response": "I can help with email automation tasks! Try asking to 'write an email', 'give email ideas', or 'summarize' an email."}
+    except Exception as e:
+        logger.error(f"Chat processing failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to process chat message: {str(e)}")
 
 @app.post("/send-email")
 async def api_send_email(request: EmailRequest):
@@ -721,57 +769,6 @@ async def api_get_notifications():
 @app.get("/history")
 async def api_get_history():
     return email_history
-
-# AI Command Endpoints
-@app.post("/ai/generate")
-async def ai_generate(request: AIRequest):
-    try:
-        result = gemini_write_email(request.input)
-        return {"result": result}
-    except Exception as e:
-        logger.error(f"AI generate failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to generate email: {str(e)}")
-
-@app.post("/ai/summarize")
-async def ai_summarize(request: AIRequest):
-    try:
-        result = gemini_summarize_email(request.input)
-        return {"result": result}
-    except Exception as e:
-        logger.error(f"AI summarize failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to summarize email: {str(e)}")
-
-@app.post("/ai/revise")
-async def ai_revise(request: AIRequest):
-    try:
-        result = gemini_revise_email(request.input)
-        return {"result": result}
-    except Exception as e:
-        logger.error(f"AI revise failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to revise email: {str(e)}")
-
-@app.post("/ai/evaluate")
-async def ai_evaluate(request: AIRequest):
-    try:
-        result = gemini_evaluate_email(request.input)
-        return {"result": result}
-    except Exception as e:
-        logger.error(f"AI evaluate failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to evaluate email: {str(e)}")
-
-@app.post("/ai/send")
-async def ai_send(request: AISendRequest):
-    try:
-        result = send_email(
-            from_email=your_email,
-            to_email=request.to_email,
-            subject=request.subject,
-            body=request.body
-        )
-        return result
-    except Exception as e:
-        logger.error(f"AI send failed for {request.to_email}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to send email: {str(e)}")
 
 if __name__ == "__main__":
     email_history["rules"]["urgent_forward"] = {
