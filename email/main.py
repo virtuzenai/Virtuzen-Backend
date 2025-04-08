@@ -21,9 +21,9 @@ from pydantic import BaseModel
 import uvicorn
 import asyncio
 import email.utils
-import pytz  # Added for timezone handling
+import pytz  # For timezone handling
 
-# Optional Gemini API and OCR
+# Gemini API and OCR
 try:
     import google.generativeai as genai
 except ImportError:
@@ -58,10 +58,11 @@ model = None
 if genai:
     try:
         genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel('gemini-2.0-flash')
+        model = genai.GenerativeModel('gemini-1.5-flash')  # Correct model name
         logger.info("Gemini API initialized successfully.")
     except Exception as e:
         logger.error(f"Failed to initialize Gemini API: {str(e)}")
+        raise Exception("Gemini API initialization failed. Please check your API key and try again.")
 
 # Database structure
 HISTORY_FILE = "email_history.json"
@@ -101,18 +102,34 @@ def load_history():
             logger.info("Created new empty history file.")
         with open(HISTORY_FILE, 'r') as f:
             loaded = json.load(f)
-            # Convert timestamps back to datetime objects
+            # Convert timestamps back to datetime objects with UTC timezone
             for key in ["sent_emails", "scheduled_emails", "priority_queue", "spam_emails"]:
                 for item in loaded.get(key, []):
                     if "timestamp" in item:
-                        item["timestamp"] = datetime.fromisoformat(item["timestamp"]).replace(tzinfo=pytz.UTC)
+                        try:
+                            item["timestamp"] = datetime.fromisoformat(item["timestamp"]).replace(tzinfo=pytz.UTC)
+                        except ValueError as e:
+                            logger.error(f"Invalid timestamp format in {key}: {item['timestamp']}. Error: {str(e)}")
+                            item["timestamp"] = datetime.now(pytz.UTC)
                     if "time" in item:
-                        item["time"] = datetime.fromisoformat(item["time"]).replace(tzinfo=pytz.UTC)
+                        try:
+                            item["time"] = datetime.fromisoformat(item["time"]).replace(tzinfo=pytz.UTC)
+                        except ValueError as e:
+                            logger.error(f"Invalid time format in {key}: {item['time']}. Error: {str(e)}")
+                            item["time"] = datetime.now(pytz.UTC)
                     if "last_contact" in item:
-                        item["last_contact"] = datetime.fromisoformat(item["last_contact"]).replace(tzinfo=pytz.UTC)
+                        try:
+                            item["last_contact"] = datetime.fromisoformat(item["last_contact"]).replace(tzinfo=pytz.UTC)
+                        except ValueError as e:
+                            logger.error(f"Invalid last_contact format in {key}: {item['last_contact']}. Error: {str(e)}")
+                            item["last_contact"] = datetime.now(pytz.UTC)
             for contact in loaded["contacts"].values():
                 if "last_contact" in contact:
-                    contact["last_contact"] = datetime.fromisoformat(contact["last_contact"]).replace(tzinfo=pytz.UTC)
+                    try:
+                        contact["last_contact"] = datetime.fromisoformat(contact["last_contact"]).replace(tzinfo=pytz.UTC)
+                    except ValueError as e:
+                        logger.error(f"Invalid last_contact format in contacts: {contact['last_contact']}. Error: {str(e)}")
+                        contact["last_contact"] = datetime.now(pytz.UTC)
             # Convert tags back to defaultdict
             loaded["tags"] = defaultdict(list, loaded.get("tags", {}))
             email_history.update(loaded)
@@ -350,20 +367,11 @@ def process_attachments(email_message) -> List[Dict]:
         logger.error(f"Error processing attachments: {str(e)}")
     return attachments
 
-# Gemini functions (no rate limiting)
+# Gemini functions (no rate limiting, removed caching)
 def gemini_generate_reply(email_content: str, sender_email: str, sender_name: str, thread_id: Optional[str] = None, attachments: List[Dict] = []) -> List[str]:
     try:
         if not model:
-            logger.warning("Gemini API not available, falling back to default reply.")
-            monitor_logs.put("Gemini API not available, falling back to default reply")
-            return [f"Dear {sender_name}, I’m processing your request with utmost care. Please bear with me."]
-
-        # Check cache
-        cache_key = hashlib.md5(email_content.encode()).hexdigest()
-        if cache_key in email_history["gemini_cache"]:
-            logger.info(f"Using cached Gemini reply for email content hash: {cache_key}")
-            monitor_logs.put(f"Using cached Gemini reply for email content hash: {cache_key}")
-            return email_history["gemini_cache"][cache_key]
+            raise Exception("Gemini API not available. Please ensure the API key is valid and the model is initialized.")
 
         tone = detect_tone(email_content)
         sentiment = detect_sentiment(email_content)
@@ -388,23 +396,19 @@ def gemini_generate_reply(email_content: str, sender_email: str, sender_name: st
         )
         response = model.generate_content(prompt)
         replies = response.text.strip().split("\n\n")
-        result = replies[:3] if len(replies) >= 3 else [replies[0]] * 3 if replies else ["Default reply"]
-        
-        # Cache the response
-        email_history["gemini_cache"][cache_key] = result
-        save_history()
+        result = replies[:3] if len(replies) >= 3 else [replies[0]] * 3 if replies else ["Dear {sender_name}, I’m here to assist you. Please let me know how I can help."]
+        logger.info(f"Generated Gemini reply for {sender_email}: {result}")
+        monitor_logs.put(f"Generated Gemini reply for {sender_email}")
         return result
     except Exception as e:
         logger.error(f"Gemini reply generation failed for {sender_email}: {str(e)}")
         monitor_logs.put(f"Gemini reply generation failed for {sender_email}: {str(e)}")
-        return [f"Dear {sender_name}, I’m processing your request with utmost care. Please bear with me."]
+        raise Exception(f"Gemini reply generation failed: {str(e)}")
 
 def gemini_summarize_email(email_content: str) -> str:
     try:
         if not model:
-            logger.warning("Gemini API not available, falling back to basic summary.")
-            monitor_logs.put("Gemini API not available, falling back to basic summary")
-            return " ".join(email_content.split()[:20]) + "..."
+            raise Exception("Gemini API not available.")
         prompt = f"Summarize this email in 1-2 sentences: '{email_content}'"
         response = model.generate_content(prompt)
         return response.text.strip()
@@ -416,9 +420,7 @@ def gemini_summarize_email(email_content: str) -> str:
 def gemini_write_email(draft: str) -> str:
     try:
         if not model:
-            logger.warning("Gemini API not available, falling back to default draft.")
-            monitor_logs.put("Gemini API not available, falling back to default draft")
-            return "Dear Recipient, I’m drafting this for you. Please provide more details if needed."
+            raise Exception("Gemini API not available.")
         prompt = f"Write a professional email draft (2-4 sentences) based on: '{draft}'. Do not include a subject line in the body."
         response = model.generate_content(prompt)
         return response.text.strip()
@@ -430,9 +432,7 @@ def gemini_write_email(draft: str) -> str:
 def gemini_generate_email_ideas() -> str:
     try:
         if not model:
-            logger.warning("Gemini API not available, returning default ideas.")
-            monitor_logs.put("Gemini API not available, returning default ideas")
-            return "1. Follow-up on a meeting.\n2. Thank you email for a recent interaction.\n3. Request for feedback on a project."
+            raise Exception("Gemini API not available.")
         prompt = "Generate 3 professional email ideas (1 sentence each) for a business context."
         response = model.generate_content(prompt)
         return response.text.strip()
@@ -564,7 +564,6 @@ def fetch_new_emails(since_date: datetime) -> List[Dict]:
                     date_str = email_message.get("Date")
                     if date_str:
                         email_date = email.utils.parsedate_to_datetime(date_str)
-                        # Ensure since_date is offset-aware
                         since_date = since_date if since_date.tzinfo else since_date.replace(tzinfo=pytz.UTC)
                         if email_date < since_date:
                             continue
@@ -772,13 +771,14 @@ async def process_emails(since_date: datetime) -> Dict:
 async def process_single_email(email_data: Dict, from_email: str) -> Dict:
     try:
         sender_name = extract_sender_name(from_email)
+        # Always use Gemini to generate replies
         replies = gemini_generate_reply(
             email_data["body"], 
             from_email, 
             sender_name, 
             email_data["thread_id"], 
             email_data["attachments"]
-        ) if model else [email_history["templates"]["thanks"].format(name=sender_name, company=company_name)]
+        )
         
         # Update context and conversation history
         update_context(from_email, email_data["body"], email_data["attachments"])
@@ -996,7 +996,7 @@ async def chat_with_ai(request: ChatRequest):
     try:
         if not model:
             monitor_logs.put("Gemini API not available for chat")
-            return {"response": "Gemini API not available. Please try again later."}
+            raise HTTPException(status_code=500, detail="Gemini API not available. Please try again later.")
         
         # Check if we're in a multi-step email sending process
         if user_id in email_history["chat_state"]:
