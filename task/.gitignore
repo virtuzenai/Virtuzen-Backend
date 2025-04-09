@@ -1,7 +1,0 @@
-*.db
-*.h5
-*.pt
-*.log
-backups/
-.env
-__pycache__/
