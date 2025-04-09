@@ -91,16 +91,39 @@ email_history = {
     "processed_email_ids": set()  # Track processed email IDs to avoid duplicates
 }
 
-# Load and save history functions
+# Load and save history functions with fixed serialization
 def load_history():
     global email_history
     try:
         if not os.path.exists(HISTORY_FILE) or os.stat(HISTORY_FILE).st_size == 0:
             with open(HISTORY_FILE, 'w') as f:
-                json.dump(email_history, f)
+                json.dump({
+                    "contacts": {},
+                    "sent_emails": [],
+                    "threads": {},
+                    "scheduled_emails": [],
+                    "priority_queue": [],
+                    "spam_emails": [],
+                    "categories": {},
+                    "analytics": {
+                        "total_sent": 0,
+                        "avg_response_time": 0,
+                        "busiest_contacts": {},
+                        "response_trends": {}
+                    },
+                    "templates": email_history["templates"],
+                    "rules": {},
+                    "tags": {},
+                    "gemini_cache": {},
+                    "chat_state": {},
+                    "processed_email_ids": []
+                }, f)
             logger.info("Created new empty history file.")
+            return
+
         with open(HISTORY_FILE, 'r') as f:
             loaded = json.load(f)
+            # Convert timestamps back to datetime objects
             for key in ["sent_emails", "scheduled_emails", "priority_queue", "spam_emails"]:
                 for item in loaded.get(key, []):
                     if "timestamp" in item:
@@ -109,21 +132,42 @@ def load_history():
                         item["time"] = datetime.fromisoformat(item["time"])
                     if "last_contact" in item:
                         item["last_contact"] = datetime.fromisoformat(item["last_contact"])
-            for contact in loaded["contacts"].values():
-                contact["last_contact"] = datetime.fromisoformat(contact["last_contact"])
+            for contact in loaded.get("contacts", {}).values():
+                if "last_contact" in contact:
+                    contact["last_contact"] = datetime.fromisoformat(contact["last_contact"])
+            
+            # Ensure processed_email_ids is a set
+            processed_ids = loaded.get("processed_email_ids", [])
+            if not isinstance(processed_ids, list):
+                logger.warning("processed_email_ids in history file is not a list, resetting to empty list.")
+                processed_ids = []
             email_history.update(loaded)
-            # Convert processed_email_ids to a set
-            email_history["processed_email_ids"] = set(loaded.get("processed_email_ids", []))
-            logger.info("Loaded email history.")
+            email_history["processed_email_ids"] = set(processed_ids)
+            email_history["tags"] = defaultdict(list, loaded.get("tags", {}))
+            logger.info("Loaded email history successfully.")
     except (json.JSONDecodeError, Exception) as e:
-        logger.error(f"Failed to load history: {str(e)}. Resetting.")
+        logger.error(f"Failed to load history: {str(e)}. Resetting history file.")
         email_history.clear()
         email_history.update({
-            "contacts": {}, "sent_emails": [], "threads": {}, "scheduled_emails": [],
-            "priority_queue": [], "spam_emails": [], "categories": {}, "analytics": {
-                "total_sent": 0, "avg_response_time": 0, "busiest_contacts": {}, "response_trends": {}
-            }, "templates": email_history["templates"], "rules": {}, "tags": defaultdict(list),
-            "gemini_cache": {}, "chat_state": {}, "processed_email_ids": set()
+            "contacts": {},
+            "sent_emails": [],
+            "threads": {},
+            "scheduled_emails": [],
+            "priority_queue": [],
+            "spam_emails": [],
+            "categories": {},
+            "analytics": {
+                "total_sent": 0,
+                "avg_response_time": 0,
+                "busiest_contacts": {},
+                "response_trends": {}
+            },
+            "templates": email_history["templates"],
+            "rules": {},
+            "tags": defaultdict(list),
+            "gemini_cache": {},
+            "chat_state": {},
+            "processed_email_ids": set()
         })
         save_history()
 
@@ -131,6 +175,7 @@ def save_history():
     try:
         with open(HISTORY_FILE, 'w') as f:
             save_data = email_history.copy()
+            # Convert timestamps to ISO format strings
             for key in ["sent_emails", "scheduled_emails", "priority_queue", "spam_emails"]:
                 for item in save_data[key]:
                     if "timestamp" in item:
@@ -140,11 +185,13 @@ def save_history():
                     if "last_contact" in item:
                         item["last_contact"] = item["last_contact"].isoformat()
             for contact in save_data["contacts"].values():
-                contact["last_contact"] = contact["last_contact"].isoformat()
+                if "last_contact" in contact:
+                    contact["last_contact"] = contact["last_contact"].isoformat()
+            # Convert tags to dict and processed_email_ids to list
             save_data["tags"] = dict(save_data["tags"])
-            save_data["processed_email_ids"] = list(save_data["processed_email_ids"])  # Convert set to list for JSON serialization
+            save_data["processed_email_ids"] = list(save_data["processed_email_ids"])
             json.dump(save_data, f)
-            logger.debug("Saved history.")
+            logger.debug("Saved history successfully.")
     except Exception as e:
         logger.error(f"Failed to save history: {str(e)}")
 
@@ -347,7 +394,7 @@ def process_attachments(email_message) -> List[Dict]:
         logger.error(f"Error processing attachments: {str(e)}")
     return attachments
 
-# Gemini functions with fixed rate limit handling
+# Gemini functions
 def gemini_generate_reply(email_content: str, sender_email: str, sender_name: str, thread_id: Optional[str] = None, attachments: List[Dict] = []) -> List[str]:
     try:
         if not model:
@@ -384,7 +431,7 @@ def gemini_generate_reply(email_content: str, sender_email: str, sender_name: st
             f"Do not include subject lines in the body."
         )
 
-        # Retry logic with fixed rate limit handling
+        # Retry logic with rate limit handling
         retry_delay = 1  # Start with 1 second
         max_retries = 5
         for attempt in range(max_retries):
@@ -401,13 +448,12 @@ def gemini_generate_reply(email_content: str, sender_email: str, sender_name: st
                 return result
             except Exception as e:
                 if "429" in str(e):
-                    # Extract retry delay from error message
                     match = re.search(r"retry_delay.*?seconds:\s*(\d+)", str(e))
-                    retry_delay = int(match.group(1)) if match else 11  # Default to 11 seconds if not found
+                    retry_delay = int(match.group(1)) if match else 11
                     logger.warning(f"Gemini rate limit hit, retrying in {retry_delay} seconds (attempt {attempt + 1}/{max_retries})")
                     monitor_logs.put(f"Gemini rate limit hit, retrying in {retry_delay} seconds (attempt {attempt + 1}/{max_retries})")
                     time.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
+                    retry_delay *= 2
                 else:
                     logger.error(f"Gemini reply generation failed for {sender_email}: {str(e)}")
                     monitor_logs.put(f"Gemini reply generation failed for {sender_email}: {str(e)}")
@@ -531,7 +577,7 @@ def predict_send_time(sender_email: str) -> datetime:
         logger.error(f"Error predicting send time for {sender_email}: {str(e)}")
         return datetime.now() + timedelta(hours=1)
 
-# Email sending function with fixed timestamp handling
+# Email sending function
 def send_email(from_email: str, to_email: str, subject: str, body: str, thread_id: Optional[str] = None, message_id: Optional[str] = None, schedule_time: Optional[Union[datetime, str]] = None, forward: bool = False, attachments: List[Dict] = []) -> Dict:
     try:
         # Validate email address
@@ -567,7 +613,6 @@ def send_email(from_email: str, to_email: str, subject: str, body: str, thread_i
         now = datetime.now()
         recent_emails = []
         for e in email_history["sent_emails"]:
-            # Convert timestamp to datetime if it's a string
             timestamp = e["timestamp"]
             if isinstance(timestamp, str):
                 timestamp = datetime.fromisoformat(timestamp)
@@ -698,7 +743,6 @@ def fetch_emails(criteria: str = "UNSEEN") -> List[Dict]:
                     if email_data["is_spam"]:
                         email_history["spam_emails"].append(email_data)
                         monitor_logs.put(f"Detected spam email from {sender}")
-                        # Mark as seen only if spam to avoid reprocessing
                         if criteria == "UNSEEN":
                             mail.store(email_id, "+FLAGS", "\\Seen")
                     else:
@@ -873,9 +917,8 @@ async def process_emails() -> Dict:
                 from_email = from_email.group(1) if isinstance(from_email, re.Match) else from_email
                 if from_email == your_email:
                     continue  # Skip emails sent by the AI
-                # Check if this email is newer than the last processed message in the thread
                 last_message_time = thread["last_message"]
-                if (datetime.now() - last_message_time).total_seconds() > 5:  # Ensure we don't reprocess the same email
+                if (datetime.now() - last_message_time).total_seconds() > 5:
                     notification_queue.put(f"New reply in thread {thread_id} from {from_email}.")
                     monitor_logs.put(f"New reply in thread {thread_id} from {from_email}")
                     result = await process_single_email(email_data, from_email)
@@ -905,7 +948,6 @@ async def process_emails() -> Dict:
 async def process_single_email(email_data: Dict, from_email: str) -> Dict:
     try:
         sender_name = extract_sender_name(from_email)
-        # Generate reply using Gemini
         replies = gemini_generate_reply(
             email_data["body"], 
             from_email, 
@@ -914,11 +956,9 @@ async def process_single_email(email_data: Dict, from_email: str) -> Dict:
             email_data["attachments"]
         )
         
-        # Update context and conversation history
         update_context(from_email, email_data["body"], email_data["attachments"])
         email_history["contacts"][from_email]["conversation_history"].append({"role": "ai", "content": replies[0]})
         
-        # Send the first reply option
         result = send_email(
             your_email, 
             from_email, 
@@ -929,7 +969,6 @@ async def process_single_email(email_data: Dict, from_email: str) -> Dict:
             forward=bool(forward_email)
         )
         
-        # Mark the email as seen and add to processed list
         try:
             mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=10)
             mail.login(your_email, your_app_password)
@@ -970,7 +1009,6 @@ def email_monitor_loop(interval: int = 5):
     async def check_emails():
         while monitor_running:
             try:
-                # Process unread emails and replies in active threads for today
                 results = await process_emails()
                 for reminder in results["reminders"]:
                     notification_queue.put(reminder)
@@ -978,7 +1016,6 @@ def email_monitor_loop(interval: int = 5):
                     notification_queue.put(f"Insight: {insight_key} = {insight_value}")
                     monitor_logs.put(f"Insight: {insight_key} = {insight_value}")
                 
-                # Handle scheduled emails
                 scheduled = email_history["scheduled_emails"][:]
                 for email in scheduled:
                     if datetime.now() >= email["time"]:
@@ -1001,7 +1038,6 @@ def email_monitor_loop(interval: int = 5):
                 monitor_logs.put(f"Error in email monitor loop: {str(e)}")
             await asyncio.sleep(interval)
     
-    # Run the async loop in a separate thread
     def run_async_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -1015,7 +1051,6 @@ def email_monitor_loop(interval: int = 5):
 # FastAPI setup
 app = FastAPI(title="Email Automation Server")
 
-# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1024,7 +1059,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Pydantic models for API requests
 class EmailRequest(BaseModel):
     to_email: str
     subject: str
@@ -1050,7 +1084,6 @@ async def root():
 async def save_credentials(request: CredentialsRequest):
     global your_email, your_app_password, company_name, agent_name, forward_email, EMAIL_HEADER, EMAIL_FOOTER
     try:
-        # Validate email format
         if not re.match(r"[^@]+@[^@]+\.[^@]+", request.your_email):
             monitor_logs.put(f"Invalid email format: {request.your_email}")
             raise HTTPException(status_code=400, detail="Invalid email format for your_email.")
@@ -1063,14 +1096,12 @@ async def save_credentials(request: CredentialsRequest):
             monitor_logs.put("Company name and agent name are required")
             raise HTTPException(status_code=400, detail="Company name and agent name are required.")
         
-        # Update global variables
         your_email = request.your_email
         your_app_password = request.your_app_password
         company_name = request.company_name
         agent_name = request.agent_name
         forward_email = request.forward_email if request.forward_email else ""
         
-        # Update email header and footer
         EMAIL_HEADER = f"\n{company_name}\n----------------------------------------"
         EMAIL_FOOTER = f"----------------------------------------\nBest regards,\n{agent_name}\n{company_name}"
         
@@ -1097,7 +1128,6 @@ async def start_monitor():
         monitor_logs.put("Gemini API not available")
         raise HTTPException(status_code=500, detail="Gemini API not available. Cannot start monitor.")
     
-    # Test SMTP connection
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as smtp:
             smtp.login(your_email, your_app_password)
@@ -1105,7 +1135,6 @@ async def start_monitor():
         monitor_logs.put(f"SMTP login failed: {str(e)}")
         raise HTTPException(status_code=400, detail=f"SMTP login failed: {str(e)}. Please check your credentials.")
     
-    # Test IMAP connection
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=10)
         mail.login(your_email, your_app_password)
@@ -1144,19 +1173,17 @@ async def get_monitor_logs():
 @app.post("/chat")
 async def chat_with_ai(request: ChatRequest):
     message = request.message.lower()
-    user_id = "default_user"  # In a real app, this would be a unique user ID from the session
+    user_id = "default_user"
     try:
         if not model:
             monitor_logs.put("Gemini API not available for chat")
             return {"response": "Gemini API not available. Please try again later."}
         
-        # Check if we're in a multi-step email sending process
         if user_id in email_history["chat_state"]:
             state = email_history["chat_state"][user_id]
             step = state.get("step")
             
             if step == "ask_subject":
-                # User provided the subject
                 state["subject"] = request.message.strip()
                 state["step"] = "ask_recipient"
                 email_history["chat_state"][user_id] = state
@@ -1164,7 +1191,6 @@ async def chat_with_ai(request: ChatRequest):
                 return {"response": "Thank you! To whom should I send this email? Please provide the recipient's email address."}
             
             elif step == "ask_recipient":
-                # User provided the recipient
                 to_email = request.message.strip()
                 if not re.match(r"[^@]+@[^@]+\.[^@]+", to_email):
                     return {"response": "That email address doesn't look valid. Please provide a valid email address (e.g., example@domain.com)."}
@@ -1175,7 +1201,6 @@ async def chat_with_ai(request: ChatRequest):
                 return {"response": f"I’m ready to send the email to {to_email} with the subject '{state['subject']}' and body:\n\n{state['body']}\n\nPlease confirm if this is correct (yes/no)."}
             
             elif step == "confirm":
-                # User confirms or cancels
                 if "yes" in message or "correct" in message:
                     result = send_email(
                         from_email=your_email,
@@ -1196,9 +1221,7 @@ async def chat_with_ai(request: ChatRequest):
                     save_history()
                     return {"response": "Email sending canceled. How can I assist you further?"}
         
-        # Handle new chat requests
         if "send email" in message and "what you sent" in message:
-            # Find the last email sent by the AI
             last_sent = None
             for sent_email in reversed(email_history["sent_emails"]):
                 if sent_email["from"] == your_email:
@@ -1207,7 +1230,6 @@ async def chat_with_ai(request: ChatRequest):
             if not last_sent:
                 return {"response": "I couldn’t find any recent emails I sent. Can you specify the email content you’d like to send?"}
             
-            # Start the multi-step email sending process
             email_history["chat_state"][user_id] = {
                 "step": "ask_subject",
                 "body": last_sent["body"]
@@ -1302,7 +1324,6 @@ async def get_history():
         monitor_logs.put(f"Error in history endpoint: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# Run the FastAPI server
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8000))  # Use PORT env var for Render
+    port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
