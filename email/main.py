@@ -341,7 +341,7 @@ def process_attachments(email_message) -> List[Dict]:
         logger.error(f"Error processing attachments: {str(e)}")
     return attachments
 
-# Gemini functions
+# Gemini functions with rate limit handling
 def gemini_generate_reply(email_content: str, sender_email: str, sender_name: str, thread_id: Optional[str] = None, attachments: List[Dict] = []) -> List[str]:
     try:
         if not model:
@@ -377,14 +377,39 @@ def gemini_generate_reply(email_content: str, sender_email: str, sender_name: st
             f"- Provide actionable next steps or solutions.\n"
             f"Do not include subject lines in the body."
         )
-        response = model.generate_content(prompt)
-        replies = response.text.strip().split("\n\n")
-        result = replies[:3] if len(replies) >= 3 else [replies[0]] * 3 if replies else ["Default reply"]
+
+        # Retry logic with exponential backoff for rate limits
+        retry_delay = 1  # Start with 1 second
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                response = model.generate_content(prompt)
+                replies = response.text.strip().split("\n\n")
+                result = replies[:3] if len(replies) >= 3 else [replies[0]] * 3 if replies else ["Default reply"]
+                
+                # Cache the response
+                email_history["gemini_cache"][cache_key] = result
+                save_history()
+                logger.info(f"Gemini generated reply for {sender_email} successfully.")
+                monitor_logs.put(f"Gemini generated reply for {sender_email} successfully")
+                return result
+            except Exception as e:
+                if "429" in str(e):  # Rate limit error
+                    retry_delay = int(re.search(r"retry_delay.*?seconds:\s*(\d+)", str(e)) or [None, 11])[1]  # Default to 11 seconds if not found
+                    logger.warning(f"Gemini rate limit hit, retrying in {retry_delay} seconds (attempt {attempt + 1}/{max_retries})")
+                    monitor_logs.put(f"Gemini rate limit hit, retrying in {retry_delay} seconds (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    logger.error(f"Gemini reply generation failed for {sender_email}: {str(e)}")
+                    monitor_logs.put(f"Gemini reply generation failed for {sender_email}: {str(e)}")
+                    break
         
-        # Cache the response
-        email_history["gemini_cache"][cache_key] = result
-        save_history()
-        return result
+        # Fallback if all retries fail
+        logger.warning(f"Max retries reached for Gemini API, falling back to default reply for {sender_email}.")
+        monitor_logs.put(f"Max retries reached for Gemini API, falling back to default reply for {sender_email}")
+        return [f"Dear {sender_name}, I’m processing your request with utmost care. Please bear with me."]
+
     except Exception as e:
         logger.error(f"Gemini reply generation failed for {sender_email}: {str(e)}")
         monitor_logs.put(f"Gemini reply generation failed for {sender_email}: {str(e)}")
@@ -397,8 +422,24 @@ def gemini_summarize_email(email_content: str) -> str:
             monitor_logs.put("Gemini API not available, falling back to basic summary")
             return " ".join(email_content.split()[:20]) + "..."
         prompt = f"Summarize this email in 1-2 sentences: '{email_content}'"
-        response = model.generate_content(prompt)
-        return response.text.strip()
+        retry_delay = 1
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                response = model.generate_content(prompt)
+                return response.text.strip()
+            except Exception as e:
+                if "429" in str(e):
+                    retry_delay = int(re.search(r"retry_delay.*?seconds:\s*(\d+)", str(e)) or [None, 11])[1]
+                    logger.warning(f"Gemini rate limit hit on summarize, retrying in {retry_delay} seconds (attempt {attempt + 1}/{max_retries})")
+                    monitor_logs.put(f"Gemini rate limit hit on summarize, retrying in {retry_delay} seconds (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+                else:
+                    raise e
+        logger.warning("Max retries reached for Gemini summarize, returning basic summary.")
+        monitor_logs.put("Max retries reached for Gemini summarize, returning basic summary")
+        return " ".join(email_content.split()[:20]) + "..."
     except Exception as e:
         logger.error(f"Gemini summarize failed: {str(e)}")
         monitor_logs.put(f"Gemini summarize failed: {str(e)}")
@@ -411,8 +452,24 @@ def gemini_write_email(draft: str) -> str:
             monitor_logs.put("Gemini API not available, falling back to default draft")
             return "Dear Recipient, I’m drafting this for you. Please provide more details if needed."
         prompt = f"Write a professional email draft (2-4 sentences) based on: '{draft}'. Do not include a subject line in the body."
-        response = model.generate_content(prompt)
-        return response.text.strip()
+        retry_delay = 1
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                response = model.generate_content(prompt)
+                return response.text.strip()
+            except Exception as e:
+                if "429" in str(e):
+                    retry_delay = int(re.search(r"retry_delay.*?seconds:\s*(\d+)", str(e)) or [None, 11])[1]
+                    logger.warning(f"Gemini rate limit hit on write, retrying in {retry_delay} seconds (attempt {attempt + 1}/{max_retries})")
+                    monitor_logs.put(f"Gemini rate limit hit on write, retrying in {retry_delay} seconds (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+                else:
+                    raise e
+        logger.warning("Max retries reached for Gemini write, returning default draft.")
+        monitor_logs.put("Max retries reached for Gemini write, returning default draft")
+        return "Dear Recipient, I’m drafting this for you. Please provide more details if needed."
     except Exception as e:
         logger.error(f"Gemini write failed: {str(e)}")
         monitor_logs.put(f"Gemini write failed: {str(e)}")
@@ -425,8 +482,24 @@ def gemini_generate_email_ideas() -> str:
             monitor_logs.put("Gemini API not available, returning default ideas")
             return "1. Follow-up on a meeting.\n2. Thank you email for a recent interaction.\n3. Request for feedback on a project."
         prompt = "Generate 3 professional email ideas (1 sentence each) for a business context."
-        response = model.generate_content(prompt)
-        return response.text.strip()
+        retry_delay = 1
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                response = model.generate_content(prompt)
+                return response.text.strip()
+            except Exception as e:
+                if "429" in str(e):
+                    retry_delay = int(re.search(r"retry_delay.*?seconds:\s*(\d+)", str(e)) or [None, 11])[1]
+                    logger.warning(f"Gemini rate limit hit on email ideas, retrying in {retry_delay} seconds (attempt {attempt + 1}/{max_retries})")
+                    monitor_logs.put(f"Gemini rate limit hit on email ideas, retrying in {retry_delay} seconds (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+                else:
+                    raise e
+        logger.warning("Max retries reached for Gemini email ideas, returning default ideas.")
+        monitor_logs.put("Max retries reached for Gemini email ideas, returning default ideas")
+        return "1. Follow-up on a meeting.\n2. Thank you email for a recent interaction.\n3. Request for feedback on a project."
     except Exception as e:
         logger.error(f"Gemini generate email ideas failed: {str(e)}")
         monitor_logs.put(f"Gemini generate email ideas failed: {str(e)}")
@@ -527,7 +600,7 @@ def send_email(from_email: str, to_email: str, subject: str, body: str, thread_i
         monitor_logs.put(f"Error sending email to {to_email}: {str(e)}")
         return {"status": "error", "message": str(e)}
 
-# Fetch emails
+# Fetch emails with improved error handling
 def fetch_emails(criteria: str = "UNSEEN") -> List[Dict]:
     try:
         for attempt in range(3):
@@ -537,14 +610,14 @@ def fetch_emails(criteria: str = "UNSEEN") -> List[Dict]:
                 mail.select("inbox")
                 status, data = mail.search(None, criteria)
                 if status != "OK":
-                    raise ValueError("IMAP search failed")
+                    raise ValueError(f"IMAP search failed with status: {status}")
                 email_ids = data[0].split()
                 emails = []
                 for email_id in email_ids[-10:]:
                     status, msg_data = mail.fetch(email_id, "(RFC822)")
                     if status != "OK":
-                        logger.warning(f"Failed to fetch email ID {email_id}.")
-                        monitor_logs.put(f"Failed to fetch email ID {email_id}")
+                        logger.warning(f"Failed to fetch email ID {email_id}: status {status}")
+                        monitor_logs.put(f"Failed to fetch email ID {email_id}: status {status}")
                         continue
                     raw_email = msg_data[0][1]
                     email_message = email.message_from_bytes(raw_email)
@@ -577,11 +650,12 @@ def fetch_emails(criteria: str = "UNSEEN") -> List[Dict]:
                     if email_data["is_spam"]:
                         email_history["spam_emails"].append(email_data)
                         monitor_logs.put(f"Detected spam email from {sender}")
+                        # Mark as seen only if spam to avoid reprocessing
+                        if criteria == "UNSEEN":
+                            mail.store(email_id, "+FLAGS", "\\Seen")
                     else:
                         emails.append(email_data)
                         email_history["categories"][email_data["category"]] = email_history["categories"].get(email_data["category"], []) + [email_data["message_id"]]
-                    if criteria == "UNSEEN":
-                        mail.store(email_id, "+FLAGS", "\\Seen")
                 mail.logout()
                 logger.info(f"Fetched {len(emails)} emails with criteria {criteria}.")
                 monitor_logs.put(f"Fetched {len(emails)} emails with criteria {criteria}")
@@ -608,14 +682,14 @@ def fetch_thread_emails(thread_id: str) -> List[Dict]:
                 # Search for emails in the thread
                 status, data = mail.search(None, f'(HEADER In-Reply-To "{thread_id}")')
                 if status != "OK":
-                    raise ValueError("IMAP search failed for thread")
+                    raise ValueError(f"IMAP search failed for thread: {status}")
                 email_ids = data[0].split()
                 emails = []
                 for email_id in email_ids:
                     status, msg_data = mail.fetch(email_id, "(RFC822)")
                     if status != "OK":
-                        logger.warning(f"Failed to fetch email ID {email_id} in thread {thread_id}.")
-                        monitor_logs.put(f"Failed to fetch email ID {email_id} in thread {thread_id}")
+                        logger.warning(f"Failed to fetch email ID {email_id} in thread {thread_id}: status {status}")
+                        monitor_logs.put(f"Failed to fetch email ID {email_id} in thread {thread_id}: status {status}")
                         continue
                     raw_email = msg_data[0][1]
                     email_message = email.message_from_bytes(raw_email)
@@ -756,13 +830,14 @@ async def process_emails() -> Dict:
 async def process_single_email(email_data: Dict, from_email: str) -> Dict:
     try:
         sender_name = extract_sender_name(from_email)
+        # Generate reply using Gemini
         replies = gemini_generate_reply(
             email_data["body"], 
             from_email, 
             sender_name, 
             email_data["thread_id"], 
             email_data["attachments"]
-        ) if model else [email_history["templates"]["thanks"].format(name=sender_name, company=company_name)]
+        )
         
         # Update context and conversation history
         update_context(from_email, email_data["body"], email_data["attachments"])
@@ -779,6 +854,21 @@ async def process_single_email(email_data: Dict, from_email: str) -> Dict:
             forward=bool(forward_email)
         )
         
+        # Mark the email as seen only after successful processing
+        try:
+            mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=10)
+            mail.login(your_email, your_app_password)
+            mail.select("inbox")
+            status, _ = mail.search(None, f'(HEADER Message-ID "{email_data["message_id"]}")')
+            if status == "OK":
+                email_ids = _[0].split()
+                if email_ids:
+                    mail.store(email_ids[0], "+FLAGS", "\\Seen")
+            mail.logout()
+        except Exception as e:
+            logger.warning(f"Failed to mark email as seen for {from_email}: {str(e)}")
+            monitor_logs.put(f"Failed to mark email as seen for {from_email}: {str(e)}")
+
         logger.info(f"Processed email from {from_email}: {result['status']}")
         monitor_logs.put(f"Processed email from {from_email}: {result['message']}")
         notification_queue.put(f"Replied to email from {from_email}: {result['message']}")
@@ -949,6 +1039,8 @@ async def start_monitor():
     
     monitor_running = True
     email_monitor_loop()
+    logger.info("Email monitor started successfully.")
+    monitor_logs.put("Email monitor started successfully")
     return {"message": "Email monitor started."}
 
 @app.post("/stop-monitor")
@@ -961,6 +1053,8 @@ async def stop_monitor():
     monitor_running = False
     if monitor_thread:
         monitor_thread.join()
+    logger.info("Email monitor stopped successfully.")
+    monitor_logs.put("Email monitor stopped successfully")
     return {"message": "Email monitor stopped."}
 
 @app.get("/monitor-logs")
@@ -1051,7 +1145,24 @@ async def chat_with_ai(request: ChatRequest):
             response = gemini_generate_email_ideas()
         else:
             prompt = f"You are {agent_name}, a superhuman AI from {company_name} with an INTJ personality—strategic, analytical, forward-thinking, and empathetic. Respond to: '{message}' in a professional and helpful manner with a human-like tone."
-            response = model.generate_content(prompt).text.strip()
+            retry_delay = 1
+            max_retries = 5
+            for attempt in range(max_retries):
+                try:
+                    response_obj = model.generate_content(prompt)
+                    response = response_obj.text.strip()
+                    break
+                except Exception as e:
+                    if "429" in str(e):
+                        retry_delay = int(re.search(r"retry_delay.*?seconds:\s*(\d+)", str(e)) or [None, 11])[1]
+                        logger.warning(f"Gemini rate limit hit on chat, retrying in {retry_delay} seconds (attempt {attempt + 1}/{max_retries})")
+                        monitor_logs.put(f"Gemini rate limit hit on chat, retrying in {retry_delay} seconds (attempt {attempt + 1}/{max_retries})")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2
+                    else:
+                        raise e
+            else:
+                response = "I’m sorry, I couldn’t process your request due to rate limits. Please try again later."
         
         logger.info(f"Chat response generated for message: {message}")
         monitor_logs.put(f"Chat response generated for message: {message}")
