@@ -1,0 +1,34 @@
+# Python-specific ignores
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment directories
+venv/
+env/
+.env
+
+# Dependency directories
+*.egg-info/
+dist/
+build/
+
+# Log files
+*.log
+
+# SQLite databases
+*.db
+tasks.db
+users.db
+
+# Sensitive files
+encryption.key
+
+# Editor/IDE files
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# macOS-specific files
+.DS_Store
