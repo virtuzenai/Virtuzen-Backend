@@ -1,4 +1,5 @@
 import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # Suppress TensorFlow warnings
 import json
 import datetime
 import time
@@ -132,6 +133,68 @@ class PriorityNet(nn.Module):
         x = self.relu(self.fc1(x))
         x = self.relu(self.fc2(x))
         return self.fc3(x)
+
+# --- Security Manager ---
+class SecurityManager:
+    def __init__(self):
+        self.users = self.load_users()
+
+    def load_users(self):
+        try:
+            with sqlite3.connect(USER_DB) as conn:
+                users = conn.execute("SELECT username, password FROM users").fetchall()
+                return {u[0]: u[1] for u in users}
+        except sqlite3.Error as e:
+            logging.error(f"Error loading users: {e}")
+            return {}
+
+    def save_users(self):
+        with db_lock:
+            try:
+                with sqlite3.connect(USER_DB) as conn:
+                    for username, password in self.users.items():
+                        conn.execute("INSERT OR REPLACE INTO users (username, password) VALUES (?, ?)", 
+                                    (username, password))
+                    conn.commit()
+                logging.info("Users saved successfully.")
+            except sqlite3.Error as e:
+                logging.error(f"Error saving users: {e}")
+                raise
+
+    def register(self, username, password):
+        if not username or not password:
+            return False, "Username and password cannot be empty."
+        if username in self.users:
+            logging.warning(f"Registration attempt for existing user: {username}")
+            return False, f"Username '{username}' is already taken."
+        try:
+            encrypted_pass = cipher.encrypt(password.encode()).decode()
+            self.users[username] = encrypted_pass
+            self.save_users()
+            logging.info(f"User registered: {username}")
+            return True, f"User '{username}' registered successfully."
+        except Exception as e:
+            logging.error(f"Registration error for {username}: {e}")
+            return False, f"Registration failed: {e}"
+
+    def login(self, username, password):
+        if not username or not password:
+            return False, "Username and password cannot be empty."
+        if username not in self.users:
+            logging.warning(f"Login attempt for unknown user: {username}")
+            return False, f"Username '{username}' not found. Please register."
+        try:
+            decrypted_pass = cipher.decrypt(self.users[username].encode()).decode()
+            if decrypted_pass == password:
+                logging.info(f"Login success: {username}")
+                return True, f"Welcome back, {username}!"
+            logging.warning(f"Login failed for {username}: wrong password")
+            return False, "Incorrect password."
+        except Exception as e:
+            logging.error(f"Login error for {username}: {e}")
+            return False, "Login error. Please try again."
+
+security = SecurityManager()
 
 # --- Task Scheduler ---
 class TaskSchedulerAI:
@@ -616,23 +679,6 @@ class TaskSchedulerAI:
             finally:
                 conn.close()
 
-    def save_workflow(self, name, task_ids):
-        with db_lock:
-            try:
-                conn = sqlite3.connect(TASK_DB)
-                tasks = [conn.execute("SELECT * FROM tasks WHERE id = ?", (tid,)).fetchone() for tid in task_ids]
-                if not all(tasks):
-                    return "One or more tasks not found."
-                workflow = [dict(zip([d[0] for d in conn.execute("PRAGMA table_info(tasks)").fetchall()], t)) for t in tasks]
-                with open(f"workflows/{name}.json", "w") as f:
-                    json.dump(workflow, f, indent=4)
-                return f"Workflow '{name}' saved."
-            except Exception as e:
-                logging.error(f"Workflow save error: {e}")
-                return "Error saving workflow."
-            finally:
-                conn.close()
-
 scheduler = TaskSchedulerAI()
 
 # --- Flask API ---
@@ -700,7 +746,22 @@ def analyze_api():
     result = scheduler.analyze_tasks(username)
     return jsonify({"insights": result})
 
-# --- CLI Interface for Pydroid3 ---
+@app.route("/reschedule", methods=["POST"])
+@require_auth
+def reschedule_api():
+    data = request.json
+    username = data["username"]
+    result = scheduler.proactive_reschedule(username)
+    return jsonify({"message": result})
+
+@app.route("/predict", methods=["GET"])
+@require_auth
+def predict_api():
+    username = request.args.get("username")
+    result = scheduler.predict_failure(username)
+    return jsonify({"prediction": result})
+
+# --- CLI Interface for Local Testing ---
 def cli_main():
     print("Welcome to Smart Task Scheduler!")
     while True:
@@ -724,11 +785,11 @@ def cli_main():
         try:
             command = input(f"{username}> ").strip().lower()
             if command == "exit":
-                print(f"Goodbye! Points: {scheduler.user_points[username]}, Streak: {scheduler.streak[username]}")
+                print("Goodbye!")
                 break
             elif command == "help":
                 print("Commands: add <task> [template=<name>], list [all|pending|completed], complete <id>, optimize, analyze, "
-                      "progress <id> <percent>, cluster, reschedule, predict, workflow <name> <id1> <id2>..., exit")
+                      "reschedule, predict, exit")
             elif command.startswith("add "):
                 parts = command.split("template=")
                 task_input = parts[0][4:].strip()
@@ -746,32 +807,17 @@ def cli_main():
                 print("Optimized Schedule:\n" + scheduler.optimize_tasks())
             elif command == "analyze":
                 print(scheduler.analyze_tasks(username))
-            elif command.startswith("progress "):
-                parts = command.split()
-                if len(parts) != 3 or not parts[2].isdigit():
-                    print("Usage: progress <id> <percent>")
-                else:
-                    print(scheduler.update_progress(parts[1], int(parts[2])))
-            elif command == "cluster":
-                scheduler.cluster_tasks(username)
-                print("Tasks clustered.")
             elif command == "reschedule":
                 print(scheduler.proactive_reschedule(username))
             elif command == "predict":
                 print(scheduler.predict_failure(username))
-            elif command.startswith("workflow "):
-                parts = command.split()
-                if len(parts) < 3:
-                    print("Usage: workflow <name> <id1> <id2>...")
-                else:
-                    print(scheduler.save_workflow(parts[1], parts[2:]))
             else:
                 print("Unknown command. Type 'help' for options.")
         except KeyboardInterrupt:
             print("\nInterrupted. Use 'exit' to quit.")
         except Exception as e:
             logging.error(f"CLI error: {e}")
-            print(f"Error: {e if DEBUG_MODE else 'Something went wrong. Try again.'}")
+            print("Something went wrong. Try again.")
 
 if __name__ == "__main__":
     if os.getenv("RENDER") == "true":

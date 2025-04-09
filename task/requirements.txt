@@ -3,7 +3,7 @@ tensorflow==2.12.0
 torch==2.0.1
 scikit-learn==1.2.2
 pandas==2.0.1
-numpy==1.23.5
+numpy==1.23.5  # Compatible with TensorFlow 2.12.0
 cryptography==41.0.1
 requests==2.31.0
 gunicorn==20.1.0
