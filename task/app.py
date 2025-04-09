@@ -110,7 +110,6 @@ def init_db():
 init_db()
 
 # --- ML Models ---
-# TensorFlow Model for Duration/Deadline Prediction
 def build_tf_model(input_dim):
     model = Sequential([
         Dense(64, activation='relu', input_dim=input_dim),
@@ -120,7 +119,6 @@ def build_tf_model(input_dim):
     model.compile(optimizer='adam', loss='mse')
     return model
 
-# PyTorch Model for Energy-Based Prioritization
 class PriorityNet(nn.Module):
     def __init__(self, input_dim):
         super(PriorityNet, self).__init__()
@@ -240,18 +238,15 @@ class TaskSchedulerAI:
                 df = pd.read_sql_query("SELECT * FROM tasks WHERE assigned_to = ? AND completed = 1", conn, params=(username,))
                 if len(df) < 5:  # Minimum data for training
                     return
-                # Duration Model
                 X_duration = np.array([[len(row["description"].split()), row["energy_level"]] for _, row in df.iterrows()])
                 y_duration = df["duration"].values
                 self.tf_duration_model.fit(X_duration, y_duration, epochs=10, batch_size=32, verbose=0)
-                # Deadline Model
                 df["days_to_deadline"] = df.apply(
                     lambda row: (datetime.datetime.fromisoformat(row["deadline"]) - 
                                 datetime.datetime.fromisoformat(row["created_at"])).days, axis=1)
                 X_deadline = np.array([[len(row["description"].split()), row["energy_level"]] for _, row in df.iterrows()])
                 y_deadline = df["days_to_deadline"].values
                 self.tf_deadline_model.fit(X_deadline, y_deadline, epochs=10, batch_size=32, verbose=0)
-                # Priority Model
                 X_priority = torch.tensor([[1 if row["priority"] == "high" else 0.5 if row["priority"] == "medium" else 0.1,
                                            row["cost"], row["duration"], row["energy_level"]] 
                                            for _, row in df.iterrows()], dtype=torch.float32)
@@ -364,7 +359,7 @@ class TaskSchedulerAI:
     def predict_duration(self, description, energy_level):
         try:
             X = np.array([[len(description.split()), energy_level]])
-            return max(15, int(self.tf_duration_model.predict(X)[0]))
+            return max(15, int(self.tf_duration_model.predict(X, verbose=0)[0]))
         except Exception as e:
             logging.error(f"Duration prediction error: {e}")
             return 60
@@ -372,7 +367,7 @@ class TaskSchedulerAI:
     def predict_deadline(self, description, username):
         try:
             X = np.array([[len(description.split()), self.preferences["energy_level"]]])
-            days = max(1, int(self.tf_deadline_model.predict(X)[0]))
+            days = max(1, int(self.tf_deadline_model.predict(X, verbose=0)[0]))
             return (datetime.datetime.now() + datetime.timedelta(days=days)).isoformat()
         except Exception as e:
             logging.error(f"Deadline prediction error: {e}")
@@ -384,7 +379,7 @@ class TaskSchedulerAI:
                               task["cost"], task["duration"], task["energy_level"]]], dtype=torch.float32)
             with torch.no_grad():
                 score = self.pt_priority_model(X).item()
-            return min(max(score, 0), 1)  # Normalize to 0-1
+            return min(max(score, 0), 1)
         except Exception as e:
             logging.error(f"Priority prediction error: {e}")
             return 0.5
@@ -679,6 +674,32 @@ class TaskSchedulerAI:
             finally:
                 conn.close()
 
+    def process_offline_queue(self):
+        while True:
+            with db_lock:
+                try:
+                    if self.offline_queue:
+                        action, data = self.offline_queue.popleft()
+                        if action == "add_task":
+                            username = data.split('_')[0] if '_' in data else "default_user"
+                            self.add_task(data, username)
+                        logging.info(f"Processed offline task: {action} - {data}")
+                    time.sleep(5)
+                except Exception as e:
+                    logging.error(f"Error processing offline queue: {e}")
+                    time.sleep(5)
+
+    def get_template(self, template_name):
+        templates = {
+            "default": {
+                "description": "{}",
+                "priority": "medium",
+                "category": "general",
+                "reminders": [300]
+            }
+        }
+        return templates.get(template_name, templates["default"])
+
 scheduler = TaskSchedulerAI()
 
 # --- Flask API ---
@@ -820,7 +841,8 @@ def cli_main():
             print("Something went wrong. Try again.")
 
 if __name__ == "__main__":
+    port = int(os.getenv("PORT", 5000))
     if os.getenv("RENDER") == "true":
-        app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+        app.run(host="0.0.0.0", port=port)
     else:
         cli_main()
