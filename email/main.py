@@ -20,13 +20,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 import asyncio
-from email.utils import parsedate_to_datetime
+import email.utils
+import pytz  # For timezone handling
 
-# Optional Gemini API and OCR
-try:
-    import google.generativeai as genai
-except ImportError:
-    genai = None
+# Gemini API (required, no fallback)
+import google.generativeai as genai
+
+# Optional OCR for attachments
 try:
     import pytesseract
     from PIL import Image
@@ -36,31 +36,30 @@ except ImportError:
     Image = None
     BytesIO = None
 
-# Setup logging with more detail for production
+# Setup logging with more detail
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s [%(funcName)s:%(lineno)d] [PID:%(process)d]',
+    format='%(asctime)s - %(levelname)s - %(message)s - %(funcName)s:%(lineno)d - %(process)d',
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
 
-# Email credentials (loaded from environment variables for production)
-your_email = os.getenv("EMAIL_ADDRESS", "")
-your_app_password = os.getenv("EMAIL_APP_PASSWORD", "")
-company_name = os.getenv("COMPANY_NAME", "")
-agent_name = os.getenv("AGENT_NAME", "")
-forward_email = os.getenv("FORWARD_EMAIL", "")
+# Email credentials (initially empty, will be set by user)
+your_email = ""
+your_app_password = ""
+company_name = ""
+agent_name = ""
+forward_email = ""
 
-# Gemini API setup
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-model = None
-if genai:
-    try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel('gemini-2.0-flash')
-        logger.info("Gemini API initialized successfully.")
-    except Exception as e:
-        logger.error(f"Failed to initialize Gemini API: {str(e)}")
+# Gemini API setup (required)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyCIN-7-mIH9Ht8cDGy4ZlGH2R9R8KRPLLk")
+try:
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel('gemini-2.0-flash')  # Use a valid model
+    logger.info("Gemini API initialized successfully.")
+except Exception as e:
+    logger.error(f"Failed to initialize Gemini API: {str(e)}")
+    raise RuntimeError("Gemini API is required for this application.")
 
 # Database structure
 HISTORY_FILE = "email_history.json"
@@ -78,96 +77,46 @@ email_history = {
         "busiest_contacts": {},
         "response_trends": {}
     },
-    "templates": {
-        "welcome": "Dear {name}, welcome to {company}! How can I assist you today?",
-        "thanks": "Dear {name}, thank you for your message. I’m here to help with any questions you have.",
-        "follow_up": "Dear {name}, I’m following up on your request. Please let me know if there’s anything specific you need.",
-        "urgent": "Dear {name}, I’m addressing your urgent request immediately. How can I assist you further?"
-    },
     "rules": {},
     "tags": defaultdict(list),
-    "gemini_cache": {},  # Cache for Gemini responses
-    "chat_state": {},  # State for chat interactions
-    "processed_email_ids": set()  # Track processed email IDs to avoid duplicates
+    "gemini_cache": {},
+    "chat_state": {}
 }
 
-# Load and save history functions with fixed serialization
+# Load and save history functions
 def load_history():
     global email_history
     try:
         if not os.path.exists(HISTORY_FILE) or os.stat(HISTORY_FILE).st_size == 0:
             with open(HISTORY_FILE, 'w') as f:
-                json.dump({
-                    "contacts": {},
-                    "sent_emails": [],
-                    "threads": {},
-                    "scheduled_emails": [],
-                    "priority_queue": [],
-                    "spam_emails": [],
-                    "categories": {},
-                    "analytics": {
-                        "total_sent": 0,
-                        "avg_response_time": 0,
-                        "busiest_contacts": {},
-                        "response_trends": {}
-                    },
-                    "templates": email_history["templates"],
-                    "rules": {},
-                    "tags": {},
-                    "gemini_cache": {},
-                    "chat_state": {},
-                    "processed_email_ids": []
-                }, f)
+                json.dump(email_history, f)
             logger.info("Created new empty history file.")
-            return
-
         with open(HISTORY_FILE, 'r') as f:
             loaded = json.load(f)
-            # Convert timestamps back to datetime objects
+            # Convert timestamps back to datetime objects with UTC timezone
             for key in ["sent_emails", "scheduled_emails", "priority_queue", "spam_emails"]:
                 for item in loaded.get(key, []):
                     if "timestamp" in item:
-                        item["timestamp"] = datetime.fromisoformat(item["timestamp"])
+                        item["timestamp"] = datetime.fromisoformat(item["timestamp"]).replace(tzinfo=pytz.UTC)
                     if "time" in item:
-                        item["time"] = datetime.fromisoformat(item["time"])
+                        item["time"] = datetime.fromisoformat(item["time"]).replace(tzinfo=pytz.UTC)
                     if "last_contact" in item:
-                        item["last_contact"] = datetime.fromisoformat(item["last_contact"])
-            for contact in loaded.get("contacts", {}).values():
+                        item["last_contact"] = datetime.fromisoformat(item["last_contact"]).replace(tzinfo=pytz.UTC)
+            for contact in loaded["contacts"].values():
                 if "last_contact" in contact:
-                    contact["last_contact"] = datetime.fromisoformat(contact["last_contact"])
-            
-            # Ensure processed_email_ids is a set
-            processed_ids = loaded.get("processed_email_ids", [])
-            if not isinstance(processed_ids, list):
-                logger.warning("processed_email_ids in history file is not a list, resetting to empty list.")
-                processed_ids = []
+                    contact["last_contact"] = datetime.fromisoformat(contact["last_contact"]).replace(tzinfo=pytz.UTC)
+            # Convert tags back to defaultdict
+            loaded["tags"] = defaultdict(list, loaded.get("tags", {}))
             email_history.update(loaded)
-            email_history["processed_email_ids"] = set(processed_ids)
-            email_history["tags"] = defaultdict(list, loaded.get("tags", {}))
-            logger.info("Loaded email history successfully.")
+            logger.info("Loaded email history.")
     except (json.JSONDecodeError, Exception) as e:
-        logger.error(f"Failed to load history: {str(e)}. Resetting history file.")
+        logger.error(f"Failed to load history: {str(e)}. Resetting.")
         email_history.clear()
         email_history.update({
-            "contacts": {},
-            "sent_emails": [],
-            "threads": {},
-            "scheduled_emails": [],
-            "priority_queue": [],
-            "spam_emails": [],
-            "categories": {},
-            "analytics": {
-                "total_sent": 0,
-                "avg_response_time": 0,
-                "busiest_contacts": {},
-                "response_trends": {}
-            },
-            "templates": email_history["templates"],
-            "rules": {},
-            "tags": defaultdict(list),
-            "gemini_cache": {},
-            "chat_state": {},
-            "processed_email_ids": set()
+            "contacts": {}, "sent_emails": [], "threads": {}, "scheduled_emails": [],
+            "priority_queue": [], "spam_emails": [], "categories": {}, "analytics": {
+                "total_sent": 0, "avg_response_time": 0, "busiest_contacts": {}, "response_trends": {}
+            }, "rules": {}, "tags": defaultdict(list), "gemini_cache": {}, "chat_state": {}
         })
         save_history()
 
@@ -175,23 +124,22 @@ def save_history():
     try:
         with open(HISTORY_FILE, 'w') as f:
             save_data = email_history.copy()
-            # Convert timestamps to ISO format strings
+            # Convert datetime objects to ISO strings
             for key in ["sent_emails", "scheduled_emails", "priority_queue", "spam_emails"]:
                 for item in save_data[key]:
-                    if "timestamp" in item:
+                    if "timestamp" in item and isinstance(item["timestamp"], datetime):
                         item["timestamp"] = item["timestamp"].isoformat()
-                    if "time" in item:
+                    if "time" in item and isinstance(item["time"], datetime):
                         item["time"] = item["time"].isoformat()
-                    if "last_contact" in item:
+                    if "last_contact" in item and isinstance(item["last_contact"], datetime):
                         item["last_contact"] = item["last_contact"].isoformat()
             for contact in save_data["contacts"].values():
-                if "last_contact" in contact:
+                if "last_contact" in contact and isinstance(contact["last_contact"], datetime):
                     contact["last_contact"] = contact["last_contact"].isoformat()
-            # Convert tags to dict and processed_email_ids to list
+            # Convert defaultdict to regular dict for JSON serialization
             save_data["tags"] = dict(save_data["tags"])
-            save_data["processed_email_ids"] = list(save_data["processed_email_ids"])
             json.dump(save_data, f)
-            logger.debug("Saved history successfully.")
+            logger.debug("Saved history.")
     except Exception as e:
         logger.error(f"Failed to save history: {str(e)}")
 
@@ -272,11 +220,9 @@ def detect_spam(email_content: str, sender: str) -> bool:
     try:
         content_lower = email_content.lower()
         spam_score = sum(1 for kw in SPAM_KEYWORDS if kw in content_lower)
-        if model:
-            prompt = f"Analyze this email content: '{email_content}' from {sender}. Is it spam? Return 'yes' or 'no'."
-            response = model.generate_content(prompt)
-            return response.text.strip().lower() == "yes"
-        return spam_score > 2 or "unsubscribe" in content_lower
+        prompt = f"Analyze this email content: '{email_content}' from {sender}. Is it spam? Return 'yes' or 'no'."
+        response = model.generate_content(prompt)
+        return response.text.strip().lower() == "yes" or spam_score > 2 or "unsubscribe" in content_lower
     except Exception as e:
         logger.error(f"Error detecting spam: {str(e)}")
         return False
@@ -288,10 +234,9 @@ def categorize_email(email_content: str) -> str:
         for cat, keywords in CATEGORY_KEYWORDS.items():
             scores[cat] = sum(1 for kw in keywords if kw in content_lower)
         category = max(scores, key=scores.get, default="general")
-        if model:
-            prompt = f"Categorize this email: '{email_content}'. Options: promotional, work, personal, general. Return one."
-            response = model.generate_content(prompt)
-            category = response.text.strip().lower()
+        prompt = f"Categorize this email: '{email_content}'. Options: promotional, work, personal, general. Return one."
+        response = model.generate_content(prompt)
+        category = response.text.strip().lower()
         return category
     except Exception as e:
         logger.error(f"Error categorizing email: {str(e)}")
@@ -322,17 +267,17 @@ def update_context(sender_email: str, email_content: str, attachments: List[Dict
     try:
         if sender_email not in email_history["contacts"]:
             email_history["contacts"][sender_email] = {
-                "name": extract_sender_name(sender_email), "last_contact": datetime.now(),
+                "name": extract_sender_name(sender_email), "last_contact": datetime.now(pytz.UTC),
                 "interactions": 0, "tone_history": [], "avg_response_time": 0, "conversation_history": [],
                 "context": {}, "tags": []
             }
         info = email_history["contacts"][sender_email]
         info["interactions"] += 1
-        info["last_contact"] = datetime.now()
+        info["last_contact"] = datetime.now(pytz.UTC)
         info["tone_history"].append(detect_tone(email_content))
-        info["conversation_history"].append({"role": "user", "content": email_content})
+        info["conversation_history"].append({"role": "user", "content": email_content, "timestamp": datetime.now(pytz.UTC)})
         if info["interactions"] > 1:
-            info["avg_response_time"] = ((info["avg_response_time"] * (info["interactions"] - 1)) + (datetime.now() - info["last_contact"]).total_seconds()) / info["interactions"]
+            info["avg_response_time"] = ((info["avg_response_time"] * (info["interactions"] - 1)) + (datetime.now(pytz.UTC) - info["last_contact"]).total_seconds()) / info["interactions"]
         
         context = info.get("context", {})
         content_lower = email_content.lower()
@@ -355,7 +300,7 @@ def update_context(sender_email: str, email_content: str, attachments: List[Dict
             context["topic"] = "general"
         info["context"] = context
         for tag in info["tags"]:
-            email_history["tags"][tag].append(info["conversation_history"][-1]["message_id"] if "message_id" in info["conversation_history"][-1] else hashlib.md5(email_content.encode()).hexdigest())
+            email_history["tags"][tag].append(info["conversation_history"][-1].get("message_id", hashlib.md5(email_content.encode()).hexdigest()))
     except Exception as e:
         logger.error(f"Error updating context for {sender_email}: {str(e)}")
 
@@ -394,14 +339,9 @@ def process_attachments(email_message) -> List[Dict]:
         logger.error(f"Error processing attachments: {str(e)}")
     return attachments
 
-# Gemini functions
+# Advanced Gemini functions (no rate limiting)
 def gemini_generate_reply(email_content: str, sender_email: str, sender_name: str, thread_id: Optional[str] = None, attachments: List[Dict] = []) -> List[str]:
     try:
-        if not model:
-            logger.warning("Gemini API not available, falling back to default reply.")
-            monitor_logs.put("Gemini API not available, falling back to default reply")
-            return [f"Dear {sender_name}, I’m processing your request with utmost care. Please bear with me."]
-
         # Check cache
         cache_key = hashlib.md5(email_content.encode()).hexdigest()
         if cache_key in email_history["gemini_cache"]:
@@ -412,89 +352,45 @@ def gemini_generate_reply(email_content: str, sender_email: str, sender_name: st
         tone = detect_tone(email_content)
         sentiment = detect_sentiment(email_content)
         language = detect_language(email_content)
-        behavior = analyze_behavior(sender_email, datetime.now())
+        behavior = analyze_behavior(sender_email, datetime.now(pytz.UTC))
         conversation = email_history["contacts"].get(sender_email, {}).get("conversation_history", [])[-5:]
         attachment_context = " ".join([att.get("ocr_text", "") for att in attachments if "ocr_text" in att])
+
+        # Advanced prompt with more context
         prompt = (
             f"You are {agent_name}, a superhuman AI from {company_name} with an INTJ personality—strategic, analytical, forward-thinking, and empathetic. "
             f"You are the smartest call center agent and customer service representative, using a human-like tone with deep emotional intelligence. "
             f"Respond to {sender_name} ({sender_email}) in {language}. "
-            f"History:\n" + "\n".join(f"{msg['role']}: {msg['content']}" for msg in conversation) +
+            f"Conversation History (last 5 messages):\n" + "\n".join(f"{msg['role']}: {msg['content']} at {msg.get('timestamp', 'unknown')}" for msg in conversation) +
             f"\nLatest email: '{email_content}'\nTone: {tone}\nSentiment: {sentiment}\nFrequency: {behavior['frequency']}\n"
             f"Attachments OCR: '{attachment_context}'\n"
             f"Generate 3 concise, professional reply options (each 2-4 sentences) that:\n"
             f"- Avoid repetition from previous replies.\n"
-            f"- Match tone, sentiment, and adapt to behavior.\n"
+            f"- Match the tone, sentiment, and adapt to the sender's behavior.\n"
             f"- Use deep contextual understanding and attachment insights.\n"
             f"- Reflect superhuman insight, empathy, and strategic thinking.\n"
             f"- Provide actionable next steps or solutions.\n"
+            f"- Personalize the response based on past interactions.\n"
             f"Do not include subject lines in the body."
         )
-
-        # Retry logic with rate limit handling
-        retry_delay = 1  # Start with 1 second
-        max_retries = 5
-        for attempt in range(max_retries):
-            try:
-                response = model.generate_content(prompt)
-                replies = response.text.strip().split("\n\n")
-                result = replies[:3] if len(replies) >= 3 else [replies[0]] * 3 if replies else ["Default reply"]
-                
-                # Cache the response
-                email_history["gemini_cache"][cache_key] = result
-                save_history()
-                logger.info(f"Gemini generated reply for {sender_email} successfully.")
-                monitor_logs.put(f"Gemini generated reply for {sender_email} successfully")
-                return result
-            except Exception as e:
-                if "429" in str(e):
-                    match = re.search(r"retry_delay.*?seconds:\s*(\d+)", str(e))
-                    retry_delay = int(match.group(1)) if match else 11
-                    logger.warning(f"Gemini rate limit hit, retrying in {retry_delay} seconds (attempt {attempt + 1}/{max_retries})")
-                    monitor_logs.put(f"Gemini rate limit hit, retrying in {retry_delay} seconds (attempt {attempt + 1}/{max_retries})")
-                    time.sleep(retry_delay)
-                    retry_delay *= 2
-                else:
-                    logger.error(f"Gemini reply generation failed for {sender_email}: {str(e)}")
-                    monitor_logs.put(f"Gemini reply generation failed for {sender_email}: {str(e)}")
-                    break
+        response = model.generate_content(prompt)
+        replies = response.text.strip().split("\n\n")
+        result = replies[:3] if len(replies) >= 3 else [replies[0]] * 3 if replies else ["Dear {sender_name}, I’m here to assist you. How can I help you today?"]
         
-        # Fallback if all retries fail
-        logger.warning(f"Max retries reached for Gemini API, falling back to default reply for {sender_email}.")
-        monitor_logs.put(f"Max retries reached for Gemini API, falling back to default reply for {sender_email}")
-        return [f"Dear {sender_name}, I’m processing your request with utmost care. Please bear with me."]
-
+        # Cache the response
+        email_history["gemini_cache"][cache_key] = result
+        save_history()
+        return result
     except Exception as e:
         logger.error(f"Gemini reply generation failed for {sender_email}: {str(e)}")
         monitor_logs.put(f"Gemini reply generation failed for {sender_email}: {str(e)}")
-        return [f"Dear {sender_name}, I’m processing your request with utmost care. Please bear with me."]
+        return [f"Dear {sender_name}, I’m here to assist you. How can I help you today? Please let me know more details."]
 
 def gemini_summarize_email(email_content: str) -> str:
     try:
-        if not model:
-            logger.warning("Gemini API not available, falling back to basic summary.")
-            monitor_logs.put("Gemini API not available, falling back to basic summary")
-            return " ".join(email_content.split()[:20]) + "..."
-        prompt = f"Summarize this email in 1-2 sentences: '{email_content}'"
-        retry_delay = 1
-        max_retries = 5
-        for attempt in range(max_retries):
-            try:
-                response = model.generate_content(prompt)
-                return response.text.strip()
-            except Exception as e:
-                if "429" in str(e):
-                    match = re.search(r"retry_delay.*?seconds:\s*(\d+)", str(e))
-                    retry_delay = int(match.group(1)) if match else 11
-                    logger.warning(f"Gemini rate limit hit on summarize, retrying in {retry_delay} seconds (attempt {attempt + 1}/{max_retries})")
-                    monitor_logs.put(f"Gemini rate limit hit on summarize, retrying in {retry_delay} seconds (attempt {attempt + 1}/{max_retries})")
-                    time.sleep(retry_delay)
-                    retry_delay *= 2
-                else:
-                    raise e
-        logger.warning("Max retries reached for Gemini summarize, returning basic summary.")
-        monitor_logs.put("Max retries reached for Gemini summarize, returning basic summary")
-        return " ".join(email_content.split()[:20]) + "..."
+        prompt = f"Summarize this email in 1-2 sentences with key points and intent: '{email_content}'"
+        response = model.generate_content(prompt)
+        return response.text.strip()
     except Exception as e:
         logger.error(f"Gemini summarize failed: {str(e)}")
         monitor_logs.put(f"Gemini summarize failed: {str(e)}")
@@ -502,30 +398,9 @@ def gemini_summarize_email(email_content: str) -> str:
 
 def gemini_write_email(draft: str) -> str:
     try:
-        if not model:
-            logger.warning("Gemini API not available, falling back to default draft.")
-            monitor_logs.put("Gemini API not available, falling back to default draft")
-            return "Dear Recipient, I’m drafting this for you. Please provide more details if needed."
-        prompt = f"Write a professional email draft (2-4 sentences) based on: '{draft}'. Do not include a subject line in the body."
-        retry_delay = 1
-        max_retries = 5
-        for attempt in range(max_retries):
-            try:
-                response = model.generate_content(prompt)
-                return response.text.strip()
-            except Exception as e:
-                if "429" in str(e):
-                    match = re.search(r"retry_delay.*?seconds:\s*(\d+)", str(e))
-                    retry_delay = int(match.group(1)) if match else 11
-                    logger.warning(f"Gemini rate limit hit on write, retrying in {retry_delay} seconds (attempt {attempt + 1}/{max_retries})")
-                    monitor_logs.put(f"Gemini rate limit hit on write, retrying in {retry_delay} seconds (attempt {attempt + 1}/{max_retries})")
-                    time.sleep(retry_delay)
-                    retry_delay *= 2
-                else:
-                    raise e
-        logger.warning("Max retries reached for Gemini write, returning default draft.")
-        monitor_logs.put("Max retries reached for Gemini write, returning default draft")
-        return "Dear Recipient, I’m drafting this for you. Please provide more details if needed."
+        prompt = f"Write a professional email draft (2-4 sentences) based on the user input: '{draft}'. Include a tone that is professional yet empathetic. Do not include a subject line in the body."
+        response = model.generate_content(prompt)
+        return response.text.strip()
     except Exception as e:
         logger.error(f"Gemini write failed: {str(e)}")
         monitor_logs.put(f"Gemini write failed: {str(e)}")
@@ -533,34 +408,13 @@ def gemini_write_email(draft: str) -> str:
 
 def gemini_generate_email_ideas() -> str:
     try:
-        if not model:
-            logger.warning("Gemini API not available, returning default ideas.")
-            monitor_logs.put("Gemini API not available, returning default ideas")
-            return "1. Follow-up on a meeting.\n2. Thank you email for a recent interaction.\n3. Request for feedback on a project."
-        prompt = "Generate 3 professional email ideas (1 sentence each) for a business context."
-        retry_delay = 1
-        max_retries = 5
-        for attempt in range(max_retries):
-            try:
-                response = model.generate_content(prompt)
-                return response.text.strip()
-            except Exception as e:
-                if "429" in str(e):
-                    match = re.search(r"retry_delay.*?seconds:\s*(\d+)", str(e))
-                    retry_delay = int(match.group(1)) if match else 11
-                    logger.warning(f"Gemini rate limit hit on email ideas, retrying in {retry_delay} seconds (attempt {attempt + 1}/{max_retries})")
-                    monitor_logs.put(f"Gemini rate limit hit on email ideas, retrying in {retry_delay} seconds (attempt {attempt + 1}/{max_retries})")
-                    time.sleep(retry_delay)
-                    retry_delay *= 2
-                else:
-                    raise e
-        logger.warning("Max retries reached for Gemini email ideas, returning default ideas.")
-        monitor_logs.put("Max retries reached for Gemini email ideas, returning default ideas")
-        return "1. Follow-up on a meeting.\n2. Thank you email for a recent interaction.\n3. Request for feedback on a project."
+        prompt = "Generate 3 professional email ideas (1 sentence each) for a business context, tailored to a customer service scenario."
+        response = model.generate_content(prompt)
+        return response.text.strip()
     except Exception as e:
         logger.error(f"Gemini generate email ideas failed: {str(e)}")
         monitor_logs.put(f"Gemini generate email ideas failed: {str(e)}")
-        return "1. Follow-up on a meeting.\n2. Thank you email for a recent interaction.\n3. Request for feedback on a project."
+        return "1. Follow-up on a recent support ticket.\n2. Thank you email for a customer’s feedback.\n3. Request for a meeting to discuss service improvements."
 
 def predict_send_time(sender_email: str) -> datetime:
     try:
@@ -569,15 +423,15 @@ def predict_send_time(sender_email: str) -> datetime:
             times = [e["timestamp"] for e in email_history["sent_emails"] if e["to"] == sender_email]
             if times:
                 avg_hour = sum(t.hour for t in times) // len(times)
-                now = datetime.now()
+                now = datetime.now(pytz.UTC)
                 scheduled = now.replace(hour=avg_hour, minute=0, second=0)
                 return scheduled + timedelta(days=1) if now.hour > avg_hour else scheduled
-        return datetime.now() + timedelta(hours=1)
+        return datetime.now(pytz.UTC) + timedelta(minutes=5)  # Default to 5 minutes from now
     except Exception as e:
         logger.error(f"Error predicting send time for {sender_email}: {str(e)}")
-        return datetime.now() + timedelta(hours=1)
+        return datetime.now(pytz.UTC) + timedelta(minutes=5)
 
-# Email sending function
+# Email sending function with robust error handling
 def send_email(from_email: str, to_email: str, subject: str, body: str, thread_id: Optional[str] = None, message_id: Optional[str] = None, schedule_time: Optional[Union[datetime, str]] = None, forward: bool = False, attachments: List[Dict] = []) -> Dict:
     try:
         # Validate email address
@@ -590,13 +444,13 @@ def send_email(from_email: str, to_email: str, subject: str, body: str, thread_i
         parsed_schedule_time = None
         if isinstance(schedule_time, str):
             try:
-                parsed_schedule_time = datetime.fromisoformat(schedule_time)
+                parsed_schedule_time = datetime.fromisoformat(schedule_time).replace(tzinfo=pytz.UTC)
             except ValueError as e:
                 logger.error(f"Invalid schedule_time format: {schedule_time}. Expected ISO format (e.g., '2025-04-08T12:00:00'). Error: {str(e)}")
                 monitor_logs.put(f"Invalid schedule_time format: {schedule_time}")
                 return {"status": "error", "message": f"Invalid schedule_time format: {str(e)}. Expected ISO format (e.g., '2025-04-08T12:00:00')."}
         elif isinstance(schedule_time, datetime):
-            parsed_schedule_time = schedule_time
+            parsed_schedule_time = schedule_time if schedule_time.tzinfo else schedule_time.replace(tzinfo=pytz.UTC)
 
         sender_name = extract_sender_name(to_email)
         email_body = f"{EMAIL_HEADER}\n\nDear {sender_name},\n\n{body}\n\n{EMAIL_FOOTER}"
@@ -609,22 +463,15 @@ def send_email(from_email: str, to_email: str, subject: str, body: str, thread_i
         msg['In-Reply-To'] = thread_id or f"thread_{int(time.time())}"
         msg.set_content(email_body)
 
-        # Check for rate limiting (local, not Gemini)
-        now = datetime.now()
-        recent_emails = []
-        for e in email_history["sent_emails"]:
-            timestamp = e["timestamp"]
-            if isinstance(timestamp, str):
-                timestamp = datetime.fromisoformat(timestamp)
-            time_diff = (now - timestamp).total_seconds()
-            if time_diff < 60:
-                recent_emails.append(e)
+        # Removed Gemini rate limiting; local rate limiting for SMTP only
+        now = datetime.now(pytz.UTC)
+        recent_emails = [e for e in email_history["sent_emails"] if (now - e["timestamp"]).total_seconds() < 60]
         if len(recent_emails) >= 5:
             parsed_schedule_time = predict_send_time(to_email)
-            logger.info(f"Rate limit hit, scheduling email for {parsed_schedule_time} to {to_email}.")
-            monitor_logs.put(f"Rate limit hit, scheduling email for {parsed_schedule_time} to {to_email}")
+            logger.info(f"SMTP rate limit hit, scheduling email for {(parsed_schedule_time)} to {to_email}.")
+            monitor_logs.put(f"SMTP rate limit hit, scheduling email for {parsed_schedule_time} to {to_email}")
 
-        if parsed_schedule_time and parsed_schedule_time > datetime.now():
+        if parsed_schedule_time and parsed_schedule_time > now:
             email_history["scheduled_emails"].append({
                 "to": to_email, "subject": subject, "body": email_body, "time": parsed_schedule_time,
                 "thread_id": thread_id, "message_id": msg['Message-ID']
@@ -640,15 +487,15 @@ def send_email(from_email: str, to_email: str, subject: str, body: str, thread_i
                     smtp.login(from_email, your_app_password)
                     smtp.send_message(msg)
                 email_history["sent_emails"].append({
-                    "to": to_email, "subject": subject, "body": body, "timestamp": datetime.now(),
-                    "thread_id": thread_id, "message_id": msg['Message-ID']
+                    "to": to_email, "subject": subject, "body": body, "timestamp": datetime.now(pytz.UTC),
+                    "thread_id": thread_id, "message_id": msg['Message-ID'], "from": from_email
                 })
                 email_history["analytics"]["total_sent"] += 1
                 if thread_id:
                     email_history["threads"][thread_id] = {
-                        "participants": [from_email, to_email], "last_message": datetime.now(),
+                        "participants": [from_email, to_email], "last_message": datetime.now(pytz.UTC),
                         "active": True, "message_ids": email_history["threads"].get(thread_id, {}).get("message_ids", []) + [msg['Message-ID']],
-                        "summary": gemini_summarize_email(body) if model else "Recent message"
+                        "summary": gemini_summarize_email(body)
                     }
                 save_history()
                 logger.info(f"Email sent successfully to {to_email} with subject '{subject}'.")
@@ -665,55 +512,36 @@ def send_email(from_email: str, to_email: str, subject: str, body: str, thread_i
         monitor_logs.put(f"Error sending email to {to_email}: {str(e)}")
         return {"status": "error", "message": str(e)}
 
-# Fetch emails with date filtering (only today's emails)
-def fetch_emails(criteria: str = "UNSEEN") -> List[Dict]:
+# Fetch new emails since a specific date
+def fetch_new_emails(since_date: datetime) -> List[Dict]:
     try:
-        today = datetime.now().date()
         for attempt in range(3):
             try:
                 mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=10)
                 mail.login(your_email, your_app_password)
                 mail.select("inbox")
-                status, data = mail.search(None, criteria)
+                # Format the date for IMAP SINCE (e.g., "08-Apr-2025")
+                since_str = since_date.strftime("%d-%b-%Y")
+                status, data = mail.search(None, f'SINCE "{since_str}"')
                 if status != "OK":
-                    raise ValueError(f"IMAP search failed with status: {status}")
+                    raise ValueError("IMAP search failed")
                 email_ids = data[0].split()
                 emails = []
-                for email_id in email_ids:
+                for email_id in email_ids[-10:]:  # Limit to last 10 emails to avoid overload
                     status, msg_data = mail.fetch(email_id, "(RFC822)")
                     if status != "OK":
-                        logger.warning(f"Failed to fetch email ID {email_id}: status {status}")
-                        monitor_logs.put(f"Failed to fetch email ID {email_id}: status {status}")
+                        logger.warning(f"Failed to fetch email ID {email_id}.")
+                        monitor_logs.put(f"Failed to fetch email ID {email_id}")
                         continue
                     raw_email = msg_data[0][1]
                     email_message = email.message_from_bytes(raw_email)
-                    
-                    # Get email date
-                    date_str = email_message.get("Date", None)
-                    if not date_str:
-                        logger.warning(f"Email ID {email_id} has no Date header, skipping.")
-                        monitor_logs.put(f"Email ID {email_id} has no Date header, skipping")
-                        continue
-                    try:
-                        email_date = parsedate_to_datetime(date_str)
-                    except Exception as e:
-                        logger.warning(f"Failed to parse date for email ID {email_id}: {str(e)}")
-                        monitor_logs.put(f"Failed to parse date for email ID {email_id}: {str(e)}")
-                        continue
-                    
-                    # Filter emails by today's date
-                    if email_date.date() != today:
-                        logger.info(f"Email ID {email_id} is not from today ({email_date.date()}), skipping.")
-                        monitor_logs.put(f"Email ID {email_id} is not from today ({email_date.date()}), skipping")
-                        continue
-
-                    # Check for duplicates
-                    message_id = email_message.get("Message-ID") or f"msg_{int(time.time())}"
-                    if message_id in email_history["processed_email_ids"]:
-                        logger.info(f"Email ID {email_id} with Message-ID {message_id} already processed, skipping.")
-                        monitor_logs.put(f"Email ID {email_id} with Message-ID {message_id} already processed, skipping")
-                        continue
-
+                    # Check the email's date to ensure it's after since_date
+                    date_str = email_message.get("Date")
+                    if date_str:
+                        email_date = email.utils.parsedate_to_datetime(date_str)
+                        since_date = since_date if since_date.tzinfo else since_date.replace(tzinfo=pytz.UTC)
+                        if email_date < since_date:
+                            continue
                     body = ""
                     if email_message.is_multipart():
                         for part in email_message.walk():
@@ -726,15 +554,15 @@ def fetch_emails(criteria: str = "UNSEEN") -> List[Dict]:
                     sender = email_message.get("From", "Unknown")
                     sender_email = re.search(r"<(.+?)>", sender) or sender
                     sender_email = sender_email.group(1) if isinstance(sender_email, re.Match) else sender
-                    behavior = analyze_behavior(sender_email, datetime.now())
+                    behavior = analyze_behavior(sender_email, datetime.now(pytz.UTC))
                     email_data = {
                         "from": sender,
                         "subject": email_message.get("Subject", "No Subject"),
                         "body": body.strip(),
                         "thread_id": email_message.get("In-Reply-To") or f"thread_{int(time.time())}",
-                        "message_id": message_id,
+                        "message_id": email_message.get("Message-ID") or f"msg_{int(time.time())}",
                         "attachments": attachments,
-                        "last_contact": datetime.now(),
+                        "last_contact": datetime.now(pytz.UTC),
                         "category": categorize_email(body),
                         "is_spam": detect_spam(body, sender),
                         "priority_score": behavior["priority_score"],
@@ -743,14 +571,14 @@ def fetch_emails(criteria: str = "UNSEEN") -> List[Dict]:
                     if email_data["is_spam"]:
                         email_history["spam_emails"].append(email_data)
                         monitor_logs.put(f"Detected spam email from {sender}")
-                        if criteria == "UNSEEN":
-                            mail.store(email_id, "+FLAGS", "\\Seen")
                     else:
                         emails.append(email_data)
                         email_history["categories"][email_data["category"]] = email_history["categories"].get(email_data["category"], []) + [email_data["message_id"]]
+                    # Mark as seen to avoid reprocessing
+                    mail.store(email_id, "+FLAGS", "\\Seen")
                 mail.logout()
-                logger.info(f"Fetched {len(emails)} unread emails with criteria {criteria} for today ({today}).")
-                monitor_logs.put(f"Fetched {len(emails)} unread emails with criteria {criteria} for today ({today})")
+                logger.info(f"Fetched {len(emails)} new emails since {since_date}.")
+                monitor_logs.put(f"Fetched {len(emails)} new emails since {since_date}")
                 return sorted(emails, key=lambda x: x["priority_score"], reverse=True)
             except Exception as e:
                 logger.warning(f"IMAP attempt {attempt + 1}/3 failed: {str(e)}")
@@ -759,14 +587,13 @@ def fetch_emails(criteria: str = "UNSEEN") -> List[Dict]:
                     raise
                 time.sleep(2 ** attempt)
     except Exception as e:
-        logger.error(f"Error fetching emails with criteria {criteria}: {str(e)}")
-        monitor_logs.put(f"Error fetching emails with criteria {criteria}: {str(e)}")
+        logger.error(f"Error fetching new emails since {since_date}: {str(e)}")
+        monitor_logs.put(f"Error fetching new emails since {since_date}: {str(e)}")
         return []
 
-# Fetch emails for a specific thread (also filter by today's date)
+# Fetch emails for a specific thread
 def fetch_thread_emails(thread_id: str) -> List[Dict]:
     try:
-        today = datetime.now().date()
         for attempt in range(3):
             try:
                 mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=10)
@@ -774,44 +601,17 @@ def fetch_thread_emails(thread_id: str) -> List[Dict]:
                 mail.select("inbox")
                 status, data = mail.search(None, f'(HEADER In-Reply-To "{thread_id}")')
                 if status != "OK":
-                    raise ValueError(f"IMAP search failed for thread: {status}")
+                    raise ValueError("IMAP search failed for thread")
                 email_ids = data[0].split()
                 emails = []
                 for email_id in email_ids:
                     status, msg_data = mail.fetch(email_id, "(RFC822)")
                     if status != "OK":
-                        logger.warning(f"Failed to fetch email ID {email_id} in thread {thread_id}: status {status}")
-                        monitor_logs.put(f"Failed to fetch email ID {email_id} in thread {thread_id}: status {status}")
+                        logger.warning(f"Failed to fetch email ID {email_id} in thread {thread_id}.")
+                        monitor_logs.put(f"Failed to fetch email ID {email_id} in thread {thread_id}")
                         continue
                     raw_email = msg_data[0][1]
                     email_message = email.message_from_bytes(raw_email)
-                    
-                    # Get email date
-                    date_str = email_message.get("Date", None)
-                    if not date_str:
-                        logger.warning(f"Email ID {email_id} in thread {thread_id} has no Date header, skipping.")
-                        monitor_logs.put(f"Email ID {email_id} in thread {thread_id} has no Date header, skipping")
-                        continue
-                    try:
-                        email_date = parsedate_to_datetime(date_str)
-                    except Exception as e:
-                        logger.warning(f"Failed to parse date for email ID {email_id} in thread {thread_id}: {str(e)}")
-                        monitor_logs.put(f"Failed to parse date for email ID {email_id} in thread {thread_id}: {str(e)}")
-                        continue
-                    
-                    # Filter emails by today's date
-                    if email_date.date() != today:
-                        logger.info(f"Email ID {email_id} in thread {thread_id} is not from today ({email_date.date()}), skipping.")
-                        monitor_logs.put(f"Email ID {email_id} in thread {thread_id} is not from today ({email_date.date()}), skipping")
-                        continue
-
-                    # Check for duplicates
-                    message_id = email_message.get("Message-ID") or f"msg_{int(time.time())}"
-                    if message_id in email_history["processed_email_ids"]:
-                        logger.info(f"Email ID {email_id} with Message-ID {message_id} in thread {thread_id} already processed, skipping.")
-                        monitor_logs.put(f"Email ID {email_id} with Message-ID {message_id} in thread {thread_id} already processed, skipping")
-                        continue
-
                     body = ""
                     if email_message.is_multipart():
                         for part in email_message.walk():
@@ -824,15 +624,15 @@ def fetch_thread_emails(thread_id: str) -> List[Dict]:
                     sender = email_message.get("From", "Unknown")
                     sender_email = re.search(r"<(.+?)>", sender) or sender
                     sender_email = sender_email.group(1) if isinstance(sender_email, re.Match) else sender
-                    behavior = analyze_behavior(sender_email, datetime.now())
+                    behavior = analyze_behavior(sender_email, datetime.now(pytz.UTC))
                     email_data = {
                         "from": sender,
                         "subject": email_message.get("Subject", "No Subject"),
                         "body": body.strip(),
                         "thread_id": thread_id,
-                        "message_id": message_id,
+                        "message_id": email_message.get("Message-ID") or f"msg_{int(time.time())}",
                         "attachments": attachments,
-                        "last_contact": datetime.now(),
+                        "last_contact": datetime.now(pytz.UTC),
                         "category": categorize_email(body),
                         "is_spam": detect_spam(body, sender),
                         "priority_score": behavior["priority_score"],
@@ -842,8 +642,8 @@ def fetch_thread_emails(thread_id: str) -> List[Dict]:
                         emails.append(email_data)
                     mail.store(email_id, "+FLAGS", "\\Seen")
                 mail.logout()
-                logger.info(f"Fetched {len(emails)} emails for thread {thread_id} for today ({today}).")
-                monitor_logs.put(f"Fetched {len(emails)} emails for thread {thread_id} for today ({today})")
+                logger.info(f"Fetched {len(emails)} emails for thread {thread_id}.")
+                monitor_logs.put(f"Fetched {len(emails)} emails for thread {thread_id}")
                 return emails
             except Exception as e:
                 logger.warning(f"IMAP attempt {attempt + 1}/3 failed for thread {thread_id}: {str(e)}")
@@ -869,21 +669,21 @@ def apply_rules(email_data: Dict) -> Optional[Dict]:
         monitor_logs.put(f"Error applying rules to email from {email_data.get('from', 'unknown')}: {str(e)}")
         return None
 
-async def process_emails() -> Dict:
+async def process_emails(since_date: datetime) -> Dict:
     try:
-        # Fetch unread emails (includes new emails) for today
-        unread_emails = fetch_emails("UNSEEN")
+        # Fetch new emails since the monitor started
+        new_emails = fetch_new_emails(since_date)
         results = {"processed": [], "reminders": [], "analytics": email_history["analytics"], "insights": {}}
         
         # Notify about new emails
-        if unread_emails:
-            notification_queue.put(f"New email(s) received: {len(unread_emails)} unread email(s) detected for today.")
-            monitor_logs.put(f"New email(s) received: {len(unread_emails)} unread email(s) detected for today")
+        if new_emails:
+            notification_queue.put(f"New email(s) received: {len(new_emails)} new email(s) detected.")
+            monitor_logs.put(f"New email(s) received: {len(new_emails)} new email(s) detected")
 
-        # Process unread emails in batches
+        # Process new emails in batches
         batch_size = 5
-        for i in range(0, len(unread_emails), batch_size):
-            batch = unread_emails[i:i + batch_size]
+        for i in range(0, len(new_emails), batch_size):
+            batch = new_emails[i:i + batch_size]
             tasks = []
             for email_data in batch:
                 if email_data["is_spam"]:
@@ -908,7 +708,7 @@ async def process_emails() -> Dict:
                     continue
                 results["processed"].append(result)
         
-        # Check for replies in active threads (also filtered by today)
+        # Check for replies in active threads
         active_threads = {tid: thread for tid, thread in email_history["threads"].items() if thread.get("active", False)}
         for thread_id, thread in active_threads.items():
             thread_emails = fetch_thread_emails(thread_id)
@@ -918,19 +718,15 @@ async def process_emails() -> Dict:
                 if from_email == your_email:
                     continue  # Skip emails sent by the AI
                 last_message_time = thread["last_message"]
-                if (datetime.now() - last_message_time).total_seconds() > 5:
+                if (datetime.now(pytz.UTC) - last_message_time).total_seconds() > 5:  # Ensure we don't reprocess
                     notification_queue.put(f"New reply in thread {thread_id} from {from_email}.")
                     monitor_logs.put(f"New reply in thread {thread_id} from {from_email}")
                     result = await process_single_email(email_data, from_email)
                     results["processed"].append(result)
-                    thread["last_message"] = datetime.now()
+                    thread["last_message"] = datetime.now(pytz.UTC)
                     save_history()
         
-        unread_count = len(unread_emails)
         spam_count = len(email_history["spam_emails"])
-        if unread_count > 0:
-            results["reminders"].append(f"You have {unread_count} unread email{'s' if unread_count > 1 else ''} for today.")
-            monitor_logs.put(f"Found {unread_count} unread emails for today")
         if spam_count > 0:
             results["reminders"].append(f"You have {spam_count} spam email{'s' if spam_count > 1 else ''} detected.")
             monitor_logs.put(f"Detected {spam_count} spam emails")
@@ -948,6 +744,7 @@ async def process_emails() -> Dict:
 async def process_single_email(email_data: Dict, from_email: str) -> Dict:
     try:
         sender_name = extract_sender_name(from_email)
+        # Always use Gemini to generate replies
         replies = gemini_generate_reply(
             email_data["body"], 
             from_email, 
@@ -956,9 +753,11 @@ async def process_single_email(email_data: Dict, from_email: str) -> Dict:
             email_data["attachments"]
         )
         
+        # Update context and conversation history
         update_context(from_email, email_data["body"], email_data["attachments"])
-        email_history["contacts"][from_email]["conversation_history"].append({"role": "ai", "content": replies[0]})
+        email_history["contacts"][from_email]["conversation_history"].append({"role": "ai", "content": replies[0], "timestamp": datetime.now(pytz.UTC)})
         
+        # Send the first reply option
         result = send_email(
             your_email, 
             from_email, 
@@ -969,22 +768,6 @@ async def process_single_email(email_data: Dict, from_email: str) -> Dict:
             forward=bool(forward_email)
         )
         
-        try:
-            mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=10)
-            mail.login(your_email, your_app_password)
-            mail.select("inbox")
-            status, _ = mail.search(None, f'(HEADER Message-ID "{email_data["message_id"]}")')
-            if status == "OK":
-                email_ids = _[0].split()
-                if email_ids:
-                    mail.store(email_ids[0], "+FLAGS", "\\Seen")
-            mail.logout()
-            email_history["processed_email_ids"].add(email_data["message_id"])
-            save_history()
-        except Exception as e:
-            logger.warning(f"Failed to mark email as seen for {from_email}: {str(e)}")
-            monitor_logs.put(f"Failed to mark email as seen for {from_email}: {str(e)}")
-
         logger.info(f"Processed email from {from_email}: {result['status']}")
         monitor_logs.put(f"Processed email from {from_email}: {result['message']}")
         notification_queue.put(f"Replied to email from {from_email}: {result['message']}")
@@ -995,30 +778,34 @@ async def process_single_email(email_data: Dict, from_email: str) -> Dict:
         monitor_logs.put(f"Error processing single email from {from_email}: {str(e)}")
         raise
 
-# Background email monitoring
+# Background email monitoring (handles all background tasks)
 notification_queue = queue.Queue()
 monitor_logs = queue.Queue()
 monitor_thread = None
 monitor_running = False
+monitor_start_time = None
 
 def email_monitor_loop(interval: int = 5):
-    global monitor_running
-    logger.info("Starting email monitor in background...")
-    monitor_logs.put("Starting email monitor in background")
+    global monitor_running, monitor_start_time
+    monitor_start_time = datetime.now(pytz.UTC)
+    logger.info(f"Starting email monitor in background at {monitor_start_time}...")
+    monitor_logs.put(f"Starting email monitor in background at {monitor_start_time}")
     
     async def check_emails():
         while monitor_running:
             try:
-                results = await process_emails()
+                # Process new emails and replies in active threads
+                results = await process_emails(monitor_start_time)
                 for reminder in results["reminders"]:
                     notification_queue.put(reminder)
                 for insight_key, insight_value in results["insights"].items():
                     notification_queue.put(f"Insight: {insight_key} = {insight_value}")
                     monitor_logs.put(f"Insight: {insight_key} = {insight_value}")
                 
+                # Handle scheduled emails
                 scheduled = email_history["scheduled_emails"][:]
                 for email in scheduled:
-                    if datetime.now() >= email["time"]:
+                    if datetime.now(pytz.UTC) >= email["time"]:
                         send_result = send_email(
                             your_email, 
                             email["to"], 
@@ -1032,12 +819,20 @@ def email_monitor_loop(interval: int = 5):
                         notification_queue.put(f"Scheduled email sent to {email['to']}: {send_result['message']}")
                         monitor_logs.put(f"Scheduled email sent to {email['to']}: {send_result['message']}")
                 
+                # Clean up old cache entries (older than 1 day)
+                now = datetime.now(pytz.UTC)
+                email_history["gemini_cache"] = {
+                    k: v for k, v in email_history["gemini_cache"].items()
+                    if (now - datetime.fromisoformat(v.get("timestamp", now.isoformat())).replace(tzinfo=pytz.UTC)).total_seconds() < 86400
+                }
+                
                 save_history()
             except Exception as e:
                 logger.error(f"Error in email monitor loop: {str(e)}")
                 monitor_logs.put(f"Error in email monitor loop: {str(e)}")
             await asyncio.sleep(interval)
     
+    # Run the async loop in a separate thread
     def run_async_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -1051,6 +846,7 @@ def email_monitor_loop(interval: int = 5):
 # FastAPI setup
 app = FastAPI(title="Email Automation Server")
 
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1059,6 +855,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Pydantic models for API requests
 class EmailRequest(BaseModel):
     to_email: str
     subject: str
@@ -1084,6 +881,7 @@ async def root():
 async def save_credentials(request: CredentialsRequest):
     global your_email, your_app_password, company_name, agent_name, forward_email, EMAIL_HEADER, EMAIL_FOOTER
     try:
+        # Validate email format
         if not re.match(r"[^@]+@[^@]+\.[^@]+", request.your_email):
             monitor_logs.put(f"Invalid email format: {request.your_email}")
             raise HTTPException(status_code=400, detail="Invalid email format for your_email.")
@@ -1096,12 +894,14 @@ async def save_credentials(request: CredentialsRequest):
             monitor_logs.put("Company name and agent name are required")
             raise HTTPException(status_code=400, detail="Company name and agent name are required.")
         
+        # Update global variables
         your_email = request.your_email
         your_app_password = request.your_app_password
         company_name = request.company_name
         agent_name = request.agent_name
         forward_email = request.forward_email if request.forward_email else ""
         
+        # Update email header and footer
         EMAIL_HEADER = f"\n{company_name}\n----------------------------------------"
         EMAIL_FOOTER = f"----------------------------------------\nBest regards,\n{agent_name}\n{company_name}"
         
@@ -1124,10 +924,7 @@ async def start_monitor():
         monitor_logs.put("SMTP credentials not set")
         raise HTTPException(status_code=400, detail="SMTP credentials not set. Please save credentials first.")
     
-    if not model:
-        monitor_logs.put("Gemini API not available")
-        raise HTTPException(status_code=500, detail="Gemini API not available. Cannot start monitor.")
-    
+    # Test SMTP connection
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as smtp:
             smtp.login(your_email, your_app_password)
@@ -1135,6 +932,7 @@ async def start_monitor():
         monitor_logs.put(f"SMTP login failed: {str(e)}")
         raise HTTPException(status_code=400, detail=f"SMTP login failed: {str(e)}. Please check your credentials.")
     
+    # Test IMAP connection
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=10)
         mail.login(your_email, your_app_password)
@@ -1145,22 +943,19 @@ async def start_monitor():
     
     monitor_running = True
     email_monitor_loop()
-    logger.info("Email monitor started successfully.")
-    monitor_logs.put("Email monitor started successfully")
     return {"message": "Email monitor started."}
 
 @app.post("/stop-monitor")
 async def stop_monitor():
-    global monitor_running, monitor_thread
+    global monitor_running, monitor_thread, monitor_start_time
     if not monitor_running:
         monitor_logs.put("Monitor is not running")
         return {"message": "Monitor is not running."}
     
     monitor_running = False
+    monitor_start_time = None
     if monitor_thread:
         monitor_thread.join()
-    logger.info("Email monitor stopped successfully.")
-    monitor_logs.put("Email monitor stopped successfully")
     return {"message": "Email monitor stopped."}
 
 @app.get("/monitor-logs")
@@ -1173,12 +968,9 @@ async def get_monitor_logs():
 @app.post("/chat")
 async def chat_with_ai(request: ChatRequest):
     message = request.message.lower()
-    user_id = "default_user"
+    user_id = "default_user"  # In a real app, this would be a unique user ID from the session
     try:
-        if not model:
-            monitor_logs.put("Gemini API not available for chat")
-            return {"response": "Gemini API not available. Please try again later."}
-        
+        # Check if we're in a multi-step email sending process
         if user_id in email_history["chat_state"]:
             state = email_history["chat_state"][user_id]
             step = state.get("step")
@@ -1221,6 +1013,7 @@ async def chat_with_ai(request: ChatRequest):
                     save_history()
                     return {"response": "Email sending canceled. How can I assist you further?"}
         
+        # Handle new chat requests
         if "send email" in message and "what you sent" in message:
             last_sent = None
             for sent_email in reversed(email_history["sent_emails"]):
@@ -1244,25 +1037,7 @@ async def chat_with_ai(request: ChatRequest):
             response = gemini_generate_email_ideas()
         else:
             prompt = f"You are {agent_name}, a superhuman AI from {company_name} with an INTJ personality—strategic, analytical, forward-thinking, and empathetic. Respond to: '{message}' in a professional and helpful manner with a human-like tone."
-            retry_delay = 1
-            max_retries = 5
-            for attempt in range(max_retries):
-                try:
-                    response_obj = model.generate_content(prompt)
-                    response = response_obj.text.strip()
-                    break
-                except Exception as e:
-                    if "429" in str(e):
-                        match = re.search(r"retry_delay.*?seconds:\s*(\d+)", str(e))
-                        retry_delay = int(match.group(1)) if match else 11
-                        logger.warning(f"Gemini rate limit hit on chat, retrying in {retry_delay} seconds (attempt {attempt + 1}/{max_retries})")
-                        monitor_logs.put(f"Gemini rate limit hit on chat, retrying in {retry_delay} seconds (attempt {attempt + 1}/{max_retries})")
-                        time.sleep(retry_delay)
-                        retry_delay *= 2
-                    else:
-                        raise e
-            else:
-                response = "I’m sorry, I couldn’t process your request due to rate limits. Please try again later."
+            response = model.generate_content(prompt).text.strip()
         
         logger.info(f"Chat response generated for message: {message}")
         monitor_logs.put(f"Chat response generated for message: {message}")
@@ -1279,11 +1054,13 @@ async def send_email_endpoint(request: EmailRequest):
         raise HTTPException(status_code=400, detail="SMTP credentials not set. Please save credentials first.")
     
     try:
+        # Use Gemini to enhance the email body
+        enhanced_body = gemini_write_email(request.body)
         result = send_email(
             from_email=your_email,
             to_email=request.to_email,
             subject=request.subject,
-            body=request.body,
+            body=enhanced_body,
             thread_id=request.thread_id,
             schedule_time=request.schedule_time,
             forward=bool(forward_email)
@@ -1295,13 +1072,16 @@ async def send_email_endpoint(request: EmailRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/fetch-emails")
-async def fetch_emails_endpoint(criteria: str = "UNSEEN"):
+async def fetch_emails_endpoint():
     if not your_email or not your_app_password:
         monitor_logs.put("SMTP credentials not set for fetching emails")
         raise HTTPException(status_code=400, detail="SMTP credentials not set. Please save credentials first.")
     
     try:
-        emails = fetch_emails(criteria)
+        if monitor_start_time:
+            emails = fetch_new_emails(monitor_start_time)
+        else:
+            emails = []
         return {"emails": emails}
     except Exception as e:
         logger.error(f"Error in fetch-emails endpoint: {str(e)}")
@@ -1324,6 +1104,6 @@ async def get_history():
         monitor_logs.put(f"Error in history endpoint: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# Run the FastAPI server
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
