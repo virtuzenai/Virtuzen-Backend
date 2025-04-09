@@ -21,12 +21,13 @@ from pydantic import BaseModel
 import uvicorn
 import asyncio
 import email.utils
-import pytz  # For timezone handling
+import pytz  # Added for timezone handling
 
-# Gemini API (required, no fallback)
-import google.generativeai as genai
-
-# Optional OCR for attachments
+# Optional Gemini API and OCR
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
 try:
     import pytesseract
     from PIL import Image
@@ -51,15 +52,16 @@ company_name = ""
 agent_name = ""
 forward_email = ""
 
-# Gemini API setup (required)
+# Gemini API setup
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyCIN-7-mIH9Ht8cDGy4ZlGH2R9R8KRPLLk")
-try:
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-2.0-flash')  # Use a valid model
-    logger.info("Gemini API initialized successfully.")
-except Exception as e:
-    logger.error(f"Failed to initialize Gemini API: {str(e)}")
-    raise RuntimeError("Gemini API is required for this application.")
+model = None
+if genai:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel('gemini-2.0-flash')
+        logger.info("Gemini API initialized successfully.")
+    except Exception as e:
+        logger.error(f"Failed to initialize Gemini API: {str(e)}")
 
 # Database structure
 HISTORY_FILE = "email_history.json"
@@ -77,6 +79,12 @@ email_history = {
         "busiest_contacts": {},
         "response_trends": {}
     },
+    "templates": {
+        "welcome": "Dear {name}, welcome to {company}! How can I assist you today?",
+        "thanks": "Dear {name}, thank you for your message. I’m here to help with any questions you have.",
+        "follow_up": "Dear {name}, I’m following up on your request. Please let me know if there’s anything specific you need.",
+        "urgent": "Dear {name}, I’m addressing your urgent request immediately. How can I assist you further?"
+    },
     "rules": {},
     "tags": defaultdict(list),
     "gemini_cache": {},
@@ -93,7 +101,7 @@ def load_history():
             logger.info("Created new empty history file.")
         with open(HISTORY_FILE, 'r') as f:
             loaded = json.load(f)
-            # Convert timestamps back to datetime objects with UTC timezone
+            # Convert timestamps back to datetime objects
             for key in ["sent_emails", "scheduled_emails", "priority_queue", "spam_emails"]:
                 for item in loaded.get(key, []):
                     if "timestamp" in item:
@@ -116,7 +124,7 @@ def load_history():
             "contacts": {}, "sent_emails": [], "threads": {}, "scheduled_emails": [],
             "priority_queue": [], "spam_emails": [], "categories": {}, "analytics": {
                 "total_sent": 0, "avg_response_time": 0, "busiest_contacts": {}, "response_trends": {}
-            }, "rules": {}, "tags": defaultdict(list), "gemini_cache": {}, "chat_state": {}
+            }, "templates": email_history["templates"], "rules": {}, "tags": defaultdict(list), "gemini_cache": {}, "chat_state": {}
         })
         save_history()
 
@@ -220,9 +228,11 @@ def detect_spam(email_content: str, sender: str) -> bool:
     try:
         content_lower = email_content.lower()
         spam_score = sum(1 for kw in SPAM_KEYWORDS if kw in content_lower)
-        prompt = f"Analyze this email content: '{email_content}' from {sender}. Is it spam? Return 'yes' or 'no'."
-        response = model.generate_content(prompt)
-        return response.text.strip().lower() == "yes" or spam_score > 2 or "unsubscribe" in content_lower
+        if model:
+            prompt = f"Analyze this email content: '{email_content}' from {sender}. Is it spam? Return 'yes' or 'no'."
+            response = model.generate_content(prompt)
+            return response.text.strip().lower() == "yes"
+        return spam_score > 2 or "unsubscribe" in content_lower
     except Exception as e:
         logger.error(f"Error detecting spam: {str(e)}")
         return False
@@ -234,9 +244,10 @@ def categorize_email(email_content: str) -> str:
         for cat, keywords in CATEGORY_KEYWORDS.items():
             scores[cat] = sum(1 for kw in keywords if kw in content_lower)
         category = max(scores, key=scores.get, default="general")
-        prompt = f"Categorize this email: '{email_content}'. Options: promotional, work, personal, general. Return one."
-        response = model.generate_content(prompt)
-        category = response.text.strip().lower()
+        if model:
+            prompt = f"Categorize this email: '{email_content}'. Options: promotional, work, personal, general. Return one."
+            response = model.generate_content(prompt)
+            category = response.text.strip().lower()
         return category
     except Exception as e:
         logger.error(f"Error categorizing email: {str(e)}")
@@ -275,7 +286,7 @@ def update_context(sender_email: str, email_content: str, attachments: List[Dict
         info["interactions"] += 1
         info["last_contact"] = datetime.now(pytz.UTC)
         info["tone_history"].append(detect_tone(email_content))
-        info["conversation_history"].append({"role": "user", "content": email_content, "timestamp": datetime.now(pytz.UTC)})
+        info["conversation_history"].append({"role": "user", "content": email_content})
         if info["interactions"] > 1:
             info["avg_response_time"] = ((info["avg_response_time"] * (info["interactions"] - 1)) + (datetime.now(pytz.UTC) - info["last_contact"]).total_seconds()) / info["interactions"]
         
@@ -300,7 +311,7 @@ def update_context(sender_email: str, email_content: str, attachments: List[Dict
             context["topic"] = "general"
         info["context"] = context
         for tag in info["tags"]:
-            email_history["tags"][tag].append(info["conversation_history"][-1].get("message_id", hashlib.md5(email_content.encode()).hexdigest()))
+            email_history["tags"][tag].append(info["conversation_history"][-1]["message_id"] if "message_id" in info["conversation_history"][-1] else hashlib.md5(email_content.encode()).hexdigest())
     except Exception as e:
         logger.error(f"Error updating context for {sender_email}: {str(e)}")
 
@@ -339,9 +350,14 @@ def process_attachments(email_message) -> List[Dict]:
         logger.error(f"Error processing attachments: {str(e)}")
     return attachments
 
-# Advanced Gemini functions (no rate limiting)
+# Gemini functions (no rate limiting)
 def gemini_generate_reply(email_content: str, sender_email: str, sender_name: str, thread_id: Optional[str] = None, attachments: List[Dict] = []) -> List[str]:
     try:
+        if not model:
+            logger.warning("Gemini API not available, falling back to default reply.")
+            monitor_logs.put("Gemini API not available, falling back to default reply")
+            return [f"Dear {sender_name}, I’m processing your request with utmost care. Please bear with me."]
+
         # Check cache
         cache_key = hashlib.md5(email_content.encode()).hexdigest()
         if cache_key in email_history["gemini_cache"]:
@@ -355,27 +371,24 @@ def gemini_generate_reply(email_content: str, sender_email: str, sender_name: st
         behavior = analyze_behavior(sender_email, datetime.now(pytz.UTC))
         conversation = email_history["contacts"].get(sender_email, {}).get("conversation_history", [])[-5:]
         attachment_context = " ".join([att.get("ocr_text", "") for att in attachments if "ocr_text" in att])
-
-        # Advanced prompt with more context
         prompt = (
             f"You are {agent_name}, a superhuman AI from {company_name} with an INTJ personality—strategic, analytical, forward-thinking, and empathetic. "
             f"You are the smartest call center agent and customer service representative, using a human-like tone with deep emotional intelligence. "
             f"Respond to {sender_name} ({sender_email}) in {language}. "
-            f"Conversation History (last 5 messages):\n" + "\n".join(f"{msg['role']}: {msg['content']} at {msg.get('timestamp', 'unknown')}" for msg in conversation) +
+            f"History:\n" + "\n".join(f"{msg['role']}: {msg['content']}" for msg in conversation) +
             f"\nLatest email: '{email_content}'\nTone: {tone}\nSentiment: {sentiment}\nFrequency: {behavior['frequency']}\n"
             f"Attachments OCR: '{attachment_context}'\n"
             f"Generate 3 concise, professional reply options (each 2-4 sentences) that:\n"
             f"- Avoid repetition from previous replies.\n"
-            f"- Match the tone, sentiment, and adapt to the sender's behavior.\n"
+            f"- Match tone, sentiment, and adapt to behavior.\n"
             f"- Use deep contextual understanding and attachment insights.\n"
             f"- Reflect superhuman insight, empathy, and strategic thinking.\n"
             f"- Provide actionable next steps or solutions.\n"
-            f"- Personalize the response based on past interactions.\n"
             f"Do not include subject lines in the body."
         )
         response = model.generate_content(prompt)
         replies = response.text.strip().split("\n\n")
-        result = replies[:3] if len(replies) >= 3 else [replies[0]] * 3 if replies else ["Dear {sender_name}, I’m here to assist you. How can I help you today?"]
+        result = replies[:3] if len(replies) >= 3 else [replies[0]] * 3 if replies else ["Default reply"]
         
         # Cache the response
         email_history["gemini_cache"][cache_key] = result
@@ -384,11 +397,15 @@ def gemini_generate_reply(email_content: str, sender_email: str, sender_name: st
     except Exception as e:
         logger.error(f"Gemini reply generation failed for {sender_email}: {str(e)}")
         monitor_logs.put(f"Gemini reply generation failed for {sender_email}: {str(e)}")
-        return [f"Dear {sender_name}, I’m here to assist you. How can I help you today? Please let me know more details."]
+        return [f"Dear {sender_name}, I’m processing your request with utmost care. Please bear with me."]
 
 def gemini_summarize_email(email_content: str) -> str:
     try:
-        prompt = f"Summarize this email in 1-2 sentences with key points and intent: '{email_content}'"
+        if not model:
+            logger.warning("Gemini API not available, falling back to basic summary.")
+            monitor_logs.put("Gemini API not available, falling back to basic summary")
+            return " ".join(email_content.split()[:20]) + "..."
+        prompt = f"Summarize this email in 1-2 sentences: '{email_content}'"
         response = model.generate_content(prompt)
         return response.text.strip()
     except Exception as e:
@@ -398,7 +415,11 @@ def gemini_summarize_email(email_content: str) -> str:
 
 def gemini_write_email(draft: str) -> str:
     try:
-        prompt = f"Write a professional email draft (2-4 sentences) based on the user input: '{draft}'. Include a tone that is professional yet empathetic. Do not include a subject line in the body."
+        if not model:
+            logger.warning("Gemini API not available, falling back to default draft.")
+            monitor_logs.put("Gemini API not available, falling back to default draft")
+            return "Dear Recipient, I’m drafting this for you. Please provide more details if needed."
+        prompt = f"Write a professional email draft (2-4 sentences) based on: '{draft}'. Do not include a subject line in the body."
         response = model.generate_content(prompt)
         return response.text.strip()
     except Exception as e:
@@ -408,13 +429,17 @@ def gemini_write_email(draft: str) -> str:
 
 def gemini_generate_email_ideas() -> str:
     try:
-        prompt = "Generate 3 professional email ideas (1 sentence each) for a business context, tailored to a customer service scenario."
+        if not model:
+            logger.warning("Gemini API not available, returning default ideas.")
+            monitor_logs.put("Gemini API not available, returning default ideas")
+            return "1. Follow-up on a meeting.\n2. Thank you email for a recent interaction.\n3. Request for feedback on a project."
+        prompt = "Generate 3 professional email ideas (1 sentence each) for a business context."
         response = model.generate_content(prompt)
         return response.text.strip()
     except Exception as e:
         logger.error(f"Gemini generate email ideas failed: {str(e)}")
         monitor_logs.put(f"Gemini generate email ideas failed: {str(e)}")
-        return "1. Follow-up on a recent support ticket.\n2. Thank you email for a customer’s feedback.\n3. Request for a meeting to discuss service improvements."
+        return "1. Follow-up on a meeting.\n2. Thank you email for a recent interaction.\n3. Request for feedback on a project."
 
 def predict_send_time(sender_email: str) -> datetime:
     try:
@@ -426,10 +451,10 @@ def predict_send_time(sender_email: str) -> datetime:
                 now = datetime.now(pytz.UTC)
                 scheduled = now.replace(hour=avg_hour, minute=0, second=0)
                 return scheduled + timedelta(days=1) if now.hour > avg_hour else scheduled
-        return datetime.now(pytz.UTC) + timedelta(minutes=5)  # Default to 5 minutes from now
+        return datetime.now(pytz.UTC) + timedelta(hours=1)
     except Exception as e:
         logger.error(f"Error predicting send time for {sender_email}: {str(e)}")
-        return datetime.now(pytz.UTC) + timedelta(minutes=5)
+        return datetime.now(pytz.UTC) + timedelta(hours=1)
 
 # Email sending function with robust error handling
 def send_email(from_email: str, to_email: str, subject: str, body: str, thread_id: Optional[str] = None, message_id: Optional[str] = None, schedule_time: Optional[Union[datetime, str]] = None, forward: bool = False, attachments: List[Dict] = []) -> Dict:
@@ -463,13 +488,13 @@ def send_email(from_email: str, to_email: str, subject: str, body: str, thread_i
         msg['In-Reply-To'] = thread_id or f"thread_{int(time.time())}"
         msg.set_content(email_body)
 
-        # Removed Gemini rate limiting; local rate limiting for SMTP only
+        # Check for rate limiting (local, not Gemini)
         now = datetime.now(pytz.UTC)
         recent_emails = [e for e in email_history["sent_emails"] if (now - e["timestamp"]).total_seconds() < 60]
         if len(recent_emails) >= 5:
             parsed_schedule_time = predict_send_time(to_email)
-            logger.info(f"SMTP rate limit hit, scheduling email for {(parsed_schedule_time)} to {to_email}.")
-            monitor_logs.put(f"SMTP rate limit hit, scheduling email for {parsed_schedule_time} to {to_email}")
+            logger.info(f"Rate limit hit, scheduling email for {parsed_schedule_time} to {to_email}.")
+            monitor_logs.put(f"Rate limit hit, scheduling email for {parsed_schedule_time} to {to_email}")
 
         if parsed_schedule_time and parsed_schedule_time > now:
             email_history["scheduled_emails"].append({
@@ -495,7 +520,7 @@ def send_email(from_email: str, to_email: str, subject: str, body: str, thread_i
                     email_history["threads"][thread_id] = {
                         "participants": [from_email, to_email], "last_message": datetime.now(pytz.UTC),
                         "active": True, "message_ids": email_history["threads"].get(thread_id, {}).get("message_ids", []) + [msg['Message-ID']],
-                        "summary": gemini_summarize_email(body)
+                        "summary": gemini_summarize_email(body) if model else "Recent message"
                     }
                 save_history()
                 logger.info(f"Email sent successfully to {to_email} with subject '{subject}'.")
@@ -527,7 +552,7 @@ def fetch_new_emails(since_date: datetime) -> List[Dict]:
                     raise ValueError("IMAP search failed")
                 email_ids = data[0].split()
                 emails = []
-                for email_id in email_ids[-10:]:  # Limit to last 10 emails to avoid overload
+                for email_id in email_ids[-10:]:
                     status, msg_data = mail.fetch(email_id, "(RFC822)")
                     if status != "OK":
                         logger.warning(f"Failed to fetch email ID {email_id}.")
@@ -539,6 +564,7 @@ def fetch_new_emails(since_date: datetime) -> List[Dict]:
                     date_str = email_message.get("Date")
                     if date_str:
                         email_date = email.utils.parsedate_to_datetime(date_str)
+                        # Ensure since_date is offset-aware
                         since_date = since_date if since_date.tzinfo else since_date.replace(tzinfo=pytz.UTC)
                         if email_date < since_date:
                             continue
@@ -599,6 +625,7 @@ def fetch_thread_emails(thread_id: str) -> List[Dict]:
                 mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=10)
                 mail.login(your_email, your_app_password)
                 mail.select("inbox")
+                # Search for emails in the thread
                 status, data = mail.search(None, f'(HEADER In-Reply-To "{thread_id}")')
                 if status != "OK":
                     raise ValueError("IMAP search failed for thread")
@@ -717,8 +744,9 @@ async def process_emails(since_date: datetime) -> Dict:
                 from_email = from_email.group(1) if isinstance(from_email, re.Match) else from_email
                 if from_email == your_email:
                     continue  # Skip emails sent by the AI
+                # Check if this email is newer than the last processed message in the thread
                 last_message_time = thread["last_message"]
-                if (datetime.now(pytz.UTC) - last_message_time).total_seconds() > 5:  # Ensure we don't reprocess
+                if (datetime.now(pytz.UTC) - last_message_time).total_seconds() > 5:  # Ensure we don't reprocess the same email
                     notification_queue.put(f"New reply in thread {thread_id} from {from_email}.")
                     monitor_logs.put(f"New reply in thread {thread_id} from {from_email}")
                     result = await process_single_email(email_data, from_email)
@@ -744,18 +772,17 @@ async def process_emails(since_date: datetime) -> Dict:
 async def process_single_email(email_data: Dict, from_email: str) -> Dict:
     try:
         sender_name = extract_sender_name(from_email)
-        # Always use Gemini to generate replies
         replies = gemini_generate_reply(
             email_data["body"], 
             from_email, 
             sender_name, 
             email_data["thread_id"], 
             email_data["attachments"]
-        )
+        ) if model else [email_history["templates"]["thanks"].format(name=sender_name, company=company_name)]
         
         # Update context and conversation history
         update_context(from_email, email_data["body"], email_data["attachments"])
-        email_history["contacts"][from_email]["conversation_history"].append({"role": "ai", "content": replies[0], "timestamp": datetime.now(pytz.UTC)})
+        email_history["contacts"][from_email]["conversation_history"].append({"role": "ai", "content": replies[0]})
         
         # Send the first reply option
         result = send_email(
@@ -778,7 +805,7 @@ async def process_single_email(email_data: Dict, from_email: str) -> Dict:
         monitor_logs.put(f"Error processing single email from {from_email}: {str(e)}")
         raise
 
-# Background email monitoring (handles all background tasks)
+# Background email monitoring
 notification_queue = queue.Queue()
 monitor_logs = queue.Queue()
 monitor_thread = None
@@ -818,13 +845,6 @@ def email_monitor_loop(interval: int = 5):
                         email_history["scheduled_emails"].remove(email)
                         notification_queue.put(f"Scheduled email sent to {email['to']}: {send_result['message']}")
                         monitor_logs.put(f"Scheduled email sent to {email['to']}: {send_result['message']}")
-                
-                # Clean up old cache entries (older than 1 day)
-                now = datetime.now(pytz.UTC)
-                email_history["gemini_cache"] = {
-                    k: v for k, v in email_history["gemini_cache"].items()
-                    if (now - datetime.fromisoformat(v.get("timestamp", now.isoformat())).replace(tzinfo=pytz.UTC)).total_seconds() < 86400
-                }
                 
                 save_history()
             except Exception as e:
@@ -924,6 +944,10 @@ async def start_monitor():
         monitor_logs.put("SMTP credentials not set")
         raise HTTPException(status_code=400, detail="SMTP credentials not set. Please save credentials first.")
     
+    if not model:
+        monitor_logs.put("Gemini API not available")
+        raise HTTPException(status_code=500, detail="Gemini API not available. Cannot start monitor.")
+    
     # Test SMTP connection
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as smtp:
@@ -970,12 +994,17 @@ async def chat_with_ai(request: ChatRequest):
     message = request.message.lower()
     user_id = "default_user"  # In a real app, this would be a unique user ID from the session
     try:
+        if not model:
+            monitor_logs.put("Gemini API not available for chat")
+            return {"response": "Gemini API not available. Please try again later."}
+        
         # Check if we're in a multi-step email sending process
         if user_id in email_history["chat_state"]:
             state = email_history["chat_state"][user_id]
             step = state.get("step")
             
             if step == "ask_subject":
+                # User provided the subject
                 state["subject"] = request.message.strip()
                 state["step"] = "ask_recipient"
                 email_history["chat_state"][user_id] = state
@@ -983,6 +1012,7 @@ async def chat_with_ai(request: ChatRequest):
                 return {"response": "Thank you! To whom should I send this email? Please provide the recipient's email address."}
             
             elif step == "ask_recipient":
+                # User provided the recipient
                 to_email = request.message.strip()
                 if not re.match(r"[^@]+@[^@]+\.[^@]+", to_email):
                     return {"response": "That email address doesn't look valid. Please provide a valid email address (e.g., example@domain.com)."}
@@ -993,6 +1023,7 @@ async def chat_with_ai(request: ChatRequest):
                 return {"response": f"I’m ready to send the email to {to_email} with the subject '{state['subject']}' and body:\n\n{state['body']}\n\nPlease confirm if this is correct (yes/no)."}
             
             elif step == "confirm":
+                # User confirms or cancels
                 if "yes" in message or "correct" in message:
                     result = send_email(
                         from_email=your_email,
@@ -1015,6 +1046,7 @@ async def chat_with_ai(request: ChatRequest):
         
         # Handle new chat requests
         if "send email" in message and "what you sent" in message:
+            # Find the last email sent by the AI
             last_sent = None
             for sent_email in reversed(email_history["sent_emails"]):
                 if sent_email["from"] == your_email:
@@ -1023,6 +1055,7 @@ async def chat_with_ai(request: ChatRequest):
             if not last_sent:
                 return {"response": "I couldn’t find any recent emails I sent. Can you specify the email content you’d like to send?"}
             
+            # Start the multi-step email sending process
             email_history["chat_state"][user_id] = {
                 "step": "ask_subject",
                 "body": last_sent["body"]
@@ -1054,13 +1087,11 @@ async def send_email_endpoint(request: EmailRequest):
         raise HTTPException(status_code=400, detail="SMTP credentials not set. Please save credentials first.")
     
     try:
-        # Use Gemini to enhance the email body
-        enhanced_body = gemini_write_email(request.body)
         result = send_email(
             from_email=your_email,
             to_email=request.to_email,
             subject=request.subject,
-            body=enhanced_body,
+            body=request.body,
             thread_id=request.thread_id,
             schedule_time=request.schedule_time,
             forward=bool(forward_email)
@@ -1078,6 +1109,7 @@ async def fetch_emails_endpoint():
         raise HTTPException(status_code=400, detail="SMTP credentials not set. Please save credentials first.")
     
     try:
+        # Fetch emails since monitor start time if available, otherwise fetch nothing
         if monitor_start_time:
             emails = fetch_new_emails(monitor_start_time)
         else:
@@ -1107,3 +1139,4 @@ async def get_history():
 # Run the FastAPI server
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
