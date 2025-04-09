@@ -8,6 +8,7 @@ import requests
 import sqlite3
 import logging
 import random
+import shutil
 from threading import Lock
 from flask import Flask, request, jsonify
 from cryptography.fernet import Fernet
@@ -40,7 +41,6 @@ SECRET_KEY = os.getenv("SECRET_KEY", "Vt2lCVXOtXU8WVe8aQQftr0TrDdNmnT/wqFv3Ilp0m
 # --- Logging Setup ---
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO, 
                     format="%(asctime)s - %(levelname)s - %(message)s")
-logging.getLogger().addHandler(logging.StreamHandler())  # Also log to console for Render
 
 # --- Thread Safety ---
 db_lock = Lock()
@@ -156,7 +156,7 @@ class SecurityManager:
                     conn.commit()
                 logging.info("Users saved successfully.")
             except sqlite3.Error as e:
-                logging.error(f"Error saving portavoz: {e}")
+                logging.error(f"Error saving users: {e}")
                 raise
 
     def register(self, username, password):
@@ -187,7 +187,7 @@ class SecurityManager:
                 logging.info(f"Login success: {username}")
                 return True, f"Welcome back, {username}!"
             logging.warning(f"Login failed for {username}: wrong password")
-            return False, "Incorrect password."
+            return False, " Áncorrect password."
         except Exception as e:
             logging.error(f"Login error for {username}: {e}")
             return False, "Login error. Please try again."
@@ -200,20 +200,15 @@ class TaskSchedulerAI:
         self.preferences = {"work_hours": (9, 17), "default_reminder": 300, "mood": "normal", "energy_level": 5}
         self.recurring_tasks = defaultdict(list)
         self.offline_queue = deque()
-        try:
-            self.tf_duration_model = build_tf_model(2)
-            self.tf_deadline_model = build_tf_model(2)
-            self.pt_priority_model = PriorityNet(4)
-            self.pt_optimizer = torch.optim.Adam(self.pt_priority_model.parameters(), lr=0.001)
-            self.pt_criterion = nn.MSELoss()
-            self.load_models()
-            threading.Thread(target=self.check_reminders, daemon=True).start()
-            threading.Thread(target=self.optimize_schedule_periodically, daemon=True).start()
-            threading.Thread(target=self.process_offline_queue, daemon=True).start()
-            logging.info("TaskSchedulerAI initialized successfully.")
-        except Exception as e:
-            logging.error(f"Failed to initialize TaskSchedulerAI: {e}")
-            raise
+        self.tf_duration_model = build_tf_model(2)  # Input: desc length, energy
+        self.tf_deadline_model = build_tf_model(2)
+        self.pt_priority_model = PriorityNet(4)  # Input: priority, cost, duration, energy
+        self.pt_optimizer = torch.optim.Adam(self.pt_priority_model.parameters(), lr=0.001)
+        self.pt_criterion = nn.MSELoss()
+        self.load_models()
+        threading.Thread(target=self.check_reminders, daemon=True).start()
+        threading.Thread(target=self.optimize_schedule_periodically, daemon=True).start()
+        threading.Thread(target=self.process_offline_queue, daemon=True).start()
 
     def load_models(self):
         try:
@@ -241,7 +236,7 @@ class TaskSchedulerAI:
             try:
                 conn = sqlite3.connect(TASK_DB)
                 df = pd.read_sql_query("SELECT * FROM tasks WHERE assigned_to = ? AND completed = 1", conn, params=(username,))
-                if len(df) < 5:
+                if len(df) < 5:  # Minimum data for training
                     return
                 X_duration = np.array([[len(row["description"].split()), row["energy_level"]] for _, row in df.iterrows()])
                 y_duration = df["duration"].values
@@ -435,6 +430,7 @@ class TaskSchedulerAI:
                 logging.error(f"Error rescheduling task {task['id']}: {e}")
             finally:
                 conn.close()
+
     def check_reminders(self):
         while True:
             with db_lock:
@@ -453,7 +449,7 @@ class TaskSchedulerAI:
                             start_hour, end_hour = self.preferences["work_hours"]
                             if (current_time >= reminder_time and current_time < deadline and
                                 start_hour <= current_time.hour < end_hour):
-                                logging.info(f"Reminder: {task_dict['custom_alert']} (ID: {task_dict['id']})")
+                                print(f"{task_dict['custom_alert']} (ID: {task_dict['id']})")
                                 break
                     time.sleep(60)
                 except sqlite3.Error as e:
@@ -704,11 +700,7 @@ class TaskSchedulerAI:
         }
         return templates.get(template_name, templates["default"])
 
-try:
-    scheduler = TaskSchedulerAI()
-except Exception as e:
-    logging.error(f"Failed to create TaskSchedulerAI instance: {e}")
-    raise
+scheduler = TaskSchedulerAI()
 
 # --- Flask API ---
 app = Flask(__name__)
@@ -742,11 +734,9 @@ def login():
 @require_auth
 def add_task_api():
     data = request.json
-    username = data.get("username")
-    task_input = data.get("task")
+    username = data["username"]
+    task_input = data["task"]
     template = data.get("template")
-    if not username or not task_input:
-        return jsonify({"message": "Username and task are required"}), 400
     result = scheduler.add_task(task_input, username, template)
     return jsonify({"message": result})
 
@@ -755,8 +745,6 @@ def add_task_api():
 def list_tasks_api():
     username = request.args.get("username")
     filter_by = request.args.get("filter", "all")
-    if not username:
-        return jsonify({"message": "Username is required"}), 400
     result = scheduler.list_tasks(username, filter_by)
     return jsonify({"tasks": result})
 
@@ -776,8 +764,6 @@ def optimize_api():
 @require_auth
 def analyze_api():
     username = request.args.get("username")
-    if not username:
-        return jsonify({"message": "Username is required"}), 400
     result = scheduler.analyze_tasks(username)
     return jsonify({"insights": result})
 
@@ -785,9 +771,7 @@ def analyze_api():
 @require_auth
 def reschedule_api():
     data = request.json
-    username = data.get("username")
-    if not username:
-        return jsonify({"message": "Username is required"}), 400
+    username = data["username"]
     result = scheduler.proactive_reschedule(username)
     return jsonify({"message": result})
 
@@ -795,12 +779,66 @@ def reschedule_api():
 @require_auth
 def predict_api():
     username = request.args.get("username")
-    if not username:
-        return jsonify({"message": "Username is required"}), 400
     result = scheduler.predict_failure(username)
     return jsonify({"prediction": result})
 
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
-    logging.info(f"Starting Flask app on port {port}")
-    app.run(host="0.0.0.0", port=port)
+# --- CLI Interface for Local Testing ---
+def cli_main():
+    print("Welcome to Smart Task Scheduler!")
+    while True:
+        username = input("Username: ")
+        password = input("Password: ")
+        success, message = security.login(username, password)
+        print(message)
+        if success:
+            break
+        if "not found" in message and input("Register? (y/n): ").lower() == "y":
+            success, reg_message = security.register(username, password)
+            print(reg_message)
+            if success:
+                break
+        if input("Try again? (y/n): ").lower() != "y":
+            print("Goodbye!")
+            return
+
+    print(f"Logged in as {username}. Use 'help' for commands.")
+    while True:
+        try:
+            command = input(f"{username}> ").strip().lower()
+            if command == "exit":
+                print("Goodbye!")
+                break
+            elif command == "help":
+                print("Commands: add <task> [template=<name>], list [all|pending|completed], complete <id>, optimize, analyze, "
+                      "reschedule, predict, exit")
+            elif command.startswith("add "):
+                parts = command.split("template=")
+                task_input = parts[0][4:].strip()
+                template = parts[1].strip() if len(parts) > 1 else None
+                print(scheduler.add_task(task_input, username, template))
+            elif command in ["list", "list all"]:
+                print(scheduler.list_tasks(username, "all"))
+            elif command == "list pending":
+                print(scheduler.list_tasks(username, "pending"))
+            elif command == "list completed":
+                print(scheduler.list_tasks(username, "completed"))
+            elif command.startswith("complete "):
+                print(scheduler.complete_task(command[9:]))
+            elif command == "optimize":
+                print("Optimized Schedule:\n" + scheduler.optimize_tasks())
+            elif command == "analyze":
+                print(scheduler.analyze_tasks(username))
+            elif command == "reschedule":
+                print(scheduler.proactive_reschedule(username))
+            elif command == "predict":
+                print(scheduler.predict_failure(username))
+            else:
+                print("Unknown command. Type 'help' for options.")
+        except KeyboardInterrupt:
+            print("\nInterrupted. Use 'exit' to quit.")
+        except Exception as e:
+            logging.error(f"CLI error: {e}")
+            print("Something went wrong. Try again.")
+
+# Removed the if __name__ == "__main__" block to let Gunicorn handle the app
+# Gunicorn will use the 'app' object directly when started with `gunicorn app:app`
