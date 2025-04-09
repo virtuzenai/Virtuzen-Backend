@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: email-automation
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: EMAIL_ADDRESS
+        sync: false
+      - key: EMAIL_APP_PASSWORD
+        sync: false
+      - key: COMPANY_NAME
+        sync: false
+      - key: AGENT_NAME
+        sync: false
+      - key: FORWARD_EMAIL
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: PORT
+        value: 8000
