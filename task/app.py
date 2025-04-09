@@ -435,7 +435,6 @@ class TaskSchedulerAI:
                 logging.error(f"Error rescheduling task {task['id']}: {e}")
             finally:
                 conn.close()
-
     def check_reminders(self):
         while True:
             with db_lock:
