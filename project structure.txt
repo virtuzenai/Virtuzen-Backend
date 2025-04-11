@@ -1,0 +1,9 @@
+virtuzen-ai/
+├── public/
+│   ├── index.html        (updated HTML file)
+│   ├── virtuzen.css     (your CSS file)
+│   └── virtuzen.js      (updated JS file)
+├── server.js            (backend proxy)
+├── package.json
+├── .env                (for local dev, not committed)
+└── .gitignore
