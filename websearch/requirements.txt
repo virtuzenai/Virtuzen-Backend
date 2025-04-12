@@ -1,3 +1,5 @@
-requests
-google-generativeai
-flask
+flask==2.3.3
+flask-cors==4.0.0
+requests==2.31.0
+google-generativeai==0.7.0
+gunicorn==22.0.0
