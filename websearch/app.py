@@ -1,6 +1,7 @@
 import requests
 import google.generativeai as genai
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import json
 import time
 from hashlib import md5
@@ -18,6 +19,7 @@ CACHE_EXPIRY_HOURS = 24
 
 # Flask app
 app = Flask(__name__)
+CORS(app, resources={r"/api/*": {"origins": "*"}})  # Allow frontend access
 
 # Initialize Gemini
 try:
@@ -46,13 +48,17 @@ def load_cache():
 
 # Save cache
 def save_cache():
-    with open(CACHE_FILE, "w") as f:
-        json.dump(CACHE, f)
+    try:
+        with open(CACHE_FILE, "w") as f:
+            json.dump(CACHE, f)
+    except Exception as e:
+        app.logger.error(f"Cache save failed: {e}")
 
 # Search function
 def execute_search_query(search_term):
     cache_key = md5(search_term.encode()).hexdigest()
     if cache_key in CACHE:
+        app.logger.info(f"Cache hit for query: {search_term}")
         return CACHE[cache_key]["data"]
 
     url = "https://www.googleapis.com/customsearch/v1"
@@ -64,7 +70,7 @@ def execute_search_query(search_term):
         "num": 5,
     }
     try:
-        response = requests.get(url, params=params, timeout=5)
+        response = requests.get(url, params=params, timeout=10)
         response.raise_for_status()
         data = response.json()
         CACHE[cache_key] = {
@@ -102,6 +108,7 @@ def rank_results(items):
 def generate_summary(search_term, search_data):
     cache_key = md5((search_term + json.dumps(search_data)).encode()).hexdigest()
     if cache_key in CACHE:
+        app.logger.info(f"Cache hit for summary: {search_term}")
         return CACHE[cache_key]["summary"]
 
     if not search_data or "items" not in search_data:
@@ -140,26 +147,40 @@ def generate_summary(search_term, search_data):
         app.logger.error(f"Summary failed: {e}")
         return "Couldn’t spin a yarn this time."
 
-# API endpoint
-@app.route('/search', methods=['POST'])
+# Health check endpoint
+@app.route('/api/health', methods=['GET'])
+def health():
+    return jsonify({
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat()
+    })
+
+# Search endpoint
+@app.route('/api/search', methods=['POST'])
 def search():
     data = request.get_json()
     query = data.get('query', '').strip()
     if not query or len(query) < 3:
         return jsonify({"error": "Hey, give me a bit more to work with—query’s too short!"}), 400
 
+    app.logger.info(f"Processing search query: {query}")
     search_results = execute_search_query(query)
     if not search_results:
+        app.logger.error("No search results returned")
         return jsonify({"error": "Aw, the web’s not cooperating today."}), 500
 
     summary = generate_summary(query, search_results)
     ranked_items = rank_results(search_results.get("items", [])[:5])
     results = [{"title": item["title"], "snippet": item.get("snippet", "No snippet"), "link": item["link"]} for item in ranked_items]
 
-    return jsonify({
+    response = {
         "summary": summary,
-        "results": results
-    })
+        "results": results,
+        "query": query,
+        "timestamp": datetime.now().isoformat()
+    }
+    app.logger.info(f"Search successful for query: {query}")
+    return jsonify(response)
 
 if __name__ == "__main__":
     load_cache()
