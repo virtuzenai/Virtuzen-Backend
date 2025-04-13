@@ -5,13 +5,12 @@ from datetime import datetime
 import plotly.graph_objects as go
 import os
 import threading
-from flask import Flask, send_file, send_from_directory, jsonify
+from flask import Flask, send_from_directory, jsonify
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
 
-# Store trading data in memory
 trading_data = {
     "prices": [],
     "times": [],
@@ -21,15 +20,11 @@ trading_data = {
 }
 max_points = 50
 
-# CoinMarketCap API setup
-CMC_API_KEY = os.getenv("CMC_API_KEY", "780af3d1-fe74-4382-8908-b8d9adb1fbfd")
+CMC_API_KEY = os.getenv("CMC_API_KEY")
 CMC_BASE_URL = "https://pro-api.coinmarketcap.com"
-
-# Gemini API setup
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyBeMGH5FDILyFBiFkiDpIX1srFaZ5ELR8M")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
 
-# Simulate a trading account
 class TradingAccount:
     def __init__(self, usd_balance=1000, btc_balance=0):
         self.usd_balance = usd_balance
@@ -57,8 +52,10 @@ class TradingAccount:
             print("Insufficient BTC balance")
             return False
 
-# Fetch BTC price from CoinMarketCap
 def get_btc_price():
+    if not CMC_API_KEY:
+        print("Error: CMC_API_KEY not set")
+        return None
     url = f"{CMC_BASE_URL}/v1/cryptocurrency/quotes/latest"
     headers = {"Accepts": "application/json", "X-CMC_PRO_API_KEY": CMC_API_KEY}
     params = {"symbol": "BTC", "convert": "USD"}
@@ -67,16 +64,20 @@ def get_btc_price():
         response.raise_for_status()
         data = response.json()
         if "data" in data and "BTC" in data["data"]:
-            return data["data"]["BTC"]["quote"]["USD"]["price"]
+            price = data["data"]["BTC"]["quote"]["USD"]["price"]
+            print(f"Fetched BTC price: ${price:.2f}")
+            return price
         else:
-            print("Error: BTC data not found")
+            print(f"Error: BTC data not found - {json.dumps(data, indent=2)}")
             return None
     except requests.exceptions.RequestException as e:
         print(f"Error fetching price: {e}")
         return None
 
-# Analyze price with Gemini API
 def analyze_with_gemini(price, prev_price):
+    if not GEMINI_API_KEY:
+        print("Error: GEMINI_API_KEY not set")
+        return None, "API key missing"
     headers = {"Content-Type": "application/json"}
     prompt = (
         f"Current BTC price: ${price:.2f}. Previous price: ${prev_price:.2f}. "
@@ -85,9 +86,7 @@ def analyze_with_gemini(price, prev_price):
         f"Example: 'buy: Price is rising steadily, indicating a potential uptrend.' "
         f"Return the response in this format."
     )
-    data = {
-        "contents": [{"parts": [{"text": prompt}]}]
-    }
+    data = {"contents": [{"parts": [{"text": prompt}]}]}
     try:
         response = requests.post(f"{GEMINI_API_URL}?key={GEMINI_API_KEY}", headers=headers, json=data)
         response.raise_for_status()
@@ -95,14 +94,15 @@ def analyze_with_gemini(price, prev_price):
         text = result.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
         if ":" in text:
             action, explanation = text.split(":", 1)
+            print(f"Gemini AI: {action.strip().lower()}: {explanation.strip()}")
             return action.strip().lower(), explanation.strip()
         else:
+            print(f"Error: Invalid Gemini response - {text}")
             return None, "Invalid response format"
     except (requests.exceptions.RequestException, KeyError) as e:
         print(f"Error with Gemini API: {e}")
         return None, str(e)
 
-# Save plot with Plotly
 def save_plot(prices, times, actions):
     if not prices or len(prices) < 2:
         print("Not enough data to plot")
@@ -139,13 +139,16 @@ def save_plot(prices, times, actions):
     except Exception as e:
         print(f"Error saving plot: {e}")
 
-# Trading bot loop
 def trading_bot():
     account = TradingAccount()
     prev_price = None
     csv_file = "static/trades.csv"
-    with open(csv_file, 'w') as f:
-        f.write("time,price,action,explanation\n")
+    try:
+        with open(csv_file, 'w') as f:
+            f.write("time,price,action,explanation\n")
+        print("Initialized trades.csv")
+    except Exception as e:
+        print(f"Error initializing trades.csv: {e}")
     print("Starting trading bot...")
     while True:
         price = get_btc_price()
@@ -161,13 +164,18 @@ def trading_bot():
             action, explanation = None, ""
             if prev_price:
                 action, explanation = analyze_with_gemini(price, prev_price)
-                trading_data["actions"].append(action)
-                if action == "buy":
-                    account.buy_btc(0.01, price)
-                elif action == "sell":
-                    account.sell_btc(0.01, price)
-                with open(csv_file, 'a') as f:
-                    f.write(f"{current_time},{price},\"{action}\",\"{explanation}\"\n")
+                if action:
+                    trading_data["actions"].append(action)
+                    if action == "buy":
+                        account.buy_btc(0.01, price)
+                    elif action == "sell":
+                        account.sell_btc(0.01, price)
+                    try:
+                        with open(csv_file, 'a') as f:
+                            f.write(f"{current_time},{price},\"{action}\",\"{explanation}\"\n")
+                        print(f"Wrote trade to CSV: {current_time}, {price}, {action}")
+                    except Exception as e:
+                        print(f"Error writing to trades.csv: {e}")
             prev_price = price
             trading_data["account"] = {"usd_balance": account.usd_balance, "btc_balance": account.btc_balance}
             trading_data["latest"] = {
@@ -178,23 +186,17 @@ def trading_bot():
             }
             if len(trading_data["prices"]) >= 2:
                 save_plot(trading_data["prices"], trading_data["times"], trading_data["actions"])
+        else:
+            print("No price data, skipping cycle")
         time.sleep(30)
-
-# Flask routes
-@app.route('/')
-def serve_index():
-    return send_file('templates/index.html')
 
 @app.route('/static/<path:filename>')
 def serve_static(filename):
     return send_from_directory('static', filename)
 
-@app.route('/<path:filename>')
-def serve_frontend(filename):
-    return send_from_directory('templates', filename)
-
 @app.route('/api/data')
 def get_data():
+    print(f"Serving /api/data: {trading_data['latest']}")
     return jsonify(trading_data["latest"])
 
 @app.route('/api/trades')
@@ -205,23 +207,24 @@ def get_trades():
             lines = f.readlines()
             headers = lines[0].strip().split(',')
             for line in lines[1:]:
-                values = line.strip().split(',', 3)  # Split into 4 parts max to handle commas in explanation
+                values = line.strip().split(',', 3)
                 trades.append({
                     "time": values[0],
                     "price": float(values[1]),
                     "action": values[2].strip('"'),
                     "explanation": values[3].strip('"')
                 })
+        print(f"Serving /api/trades: {len(trades)} trades")
     except Exception as e:
         print(f"Error reading trades.csv: {e}")
     return jsonify(trades)
 
 @app.route('/api/balances')
 def get_balances():
+    print(f"Serving /api/balances: {trading_data['account']}")
     return jsonify(trading_data["account"])
 
 if __name__ == '__main__':
     os.makedirs('static', exist_ok=True)
-    os.makedirs('templates', exist_ok=True)
     threading.Thread(target=trading_bot, daemon=True).start()
     app.run(host='0.0.0.0', port=int(os.getenv('PORT', 8080)))
