@@ -68,7 +68,7 @@ def get_btc_price():
             print(f"Fetched BTC price: ${price:.2f}")
             return price
         else:
-            print(f"Error: BTC data not found - {json.dumps(data, indent=2)}")
+            print(f"Error: BTC data not found - Response: {json.dumps(data, indent=2)}")
             return None
     except requests.exceptions.RequestException as e:
         print(f"Error fetching price: {e}")
@@ -97,7 +97,7 @@ def analyze_with_gemini(price, prev_price):
             print(f"Gemini AI: {action.strip().lower()}: {explanation.strip()}")
             return action.strip().lower(), explanation.strip()
         else:
-            print(f"Error: Invalid Gemini response - {text}")
+            print(f"Error: Invalid Gemini response - Response: {text}")
             return None, "Invalid response format"
     except (requests.exceptions.RequestException, KeyError) as e:
         print(f"Error with Gemini API: {e}")
@@ -144,15 +144,17 @@ def trading_bot():
     prev_price = None
     csv_file = "static/trades.csv"
     try:
+        os.makedirs("static", exist_ok=True)
         with open(csv_file, 'w') as f:
             f.write("time,price,action,explanation\n")
-        print("Initialized trades.csv")
+        print(f"Successfully initialized {csv_file}")
     except Exception as e:
-        print(f"Error initializing trades.csv: {e}")
+        print(f"Error initializing {csv_file}: {e}")
+        return  # Exit if CSV can't be created
     print("Starting trading bot...")
     while True:
         price = get_btc_price()
-        if price:
+        if price is not None:
             current_time = datetime.now()
             trading_data["prices"].append(price)
             trading_data["times"].append(current_time)
@@ -162,8 +164,8 @@ def trading_bot():
                 if trading_data["actions"]:
                     trading_data["actions"].pop(0)
             action, explanation = None, ""
-            if prev_price:
-                action, explanation = analyze_with_gemini(price, prev_price)
+            if prev_price is not None:
+                action, explanation = analyze_with_gemini(price, prev_price) or (None, "Gemini failed")
                 if action:
                     trading_data["actions"].append(action)
                     if action == "buy":
@@ -175,7 +177,7 @@ def trading_bot():
                             f.write(f"{current_time},{price},\"{action}\",\"{explanation}\"\n")
                         print(f"Wrote trade to CSV: {current_time}, {price}, {action}")
                     except Exception as e:
-                        print(f"Error writing to trades.csv: {e}")
+                        print(f"Error writing to {csv_file}: {e}")
             prev_price = price
             trading_data["account"] = {"usd_balance": account.usd_balance, "btc_balance": account.btc_balance}
             trading_data["latest"] = {
@@ -184,6 +186,7 @@ def trading_bot():
                 "action": action,
                 "explanation": explanation
             }
+            print(f"Updated trading_data: {trading_data['latest']}")
             if len(trading_data["prices"]) >= 2:
                 save_plot(trading_data["prices"], trading_data["times"], trading_data["actions"])
         else:
@@ -192,7 +195,11 @@ def trading_bot():
 
 @app.route('/static/<path:filename>')
 def serve_static(filename):
-    return send_from_directory('static', filename)
+    try:
+        return send_from_directory('static', filename)
+    except FileNotFoundError as e:
+        print(f"Error serving static file {filename}: {e}")
+        return jsonify({"error": f"File {filename} not found"}), 404
 
 @app.route('/api/data')
 def get_data():
@@ -202,8 +209,9 @@ def get_data():
 @app.route('/api/trades')
 def get_trades():
     trades = []
+    csv_file = "static/trades.csv"
     try:
-        with open('static/trades.csv', 'r') as f:
+        with open(csv_file, 'r') as f:
             lines = f.readlines()
             headers = lines[0].strip().split(',')
             for line in lines[1:]:
@@ -215,8 +223,11 @@ def get_trades():
                     "explanation": values[3].strip('"')
                 })
         print(f"Serving /api/trades: {len(trades)} trades")
+    except FileNotFoundError:
+        print(f"Error: {csv_file} does not exist yet")
+        trades = []
     except Exception as e:
-        print(f"Error reading trades.csv: {e}")
+        print(f"Error reading {csv_file}: {e}")
     return jsonify(trades)
 
 @app.route('/api/balances')
