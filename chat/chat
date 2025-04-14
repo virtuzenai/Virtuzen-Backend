@@ -1,0 +1,614 @@
+import os
+import json
+import re
+import asyncio
+import aiohttp
+from aiohttp import web
+import base64
+from datetime import datetime
+import logging
+from typing import Dict, List, Optional, Set
+import google.generativeai as genai
+from PIL import Image
+import io
+import PyPDF2
+
+# Configuration
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "your-gemini-api-key-here")
+DEEPL_API_KEY = os.getenv("DEEPL_API_KEY", "c7d45f58-0adb-44df-9fd9-334914371db3:fx")
+SUPPORTED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/gif"]
+MAX_RETRIES = 3
+RETRY_DELAY = 2  # seconds
+REQUEST_TIMEOUT = 10  # seconds
+RATE_LIMIT_REQUESTS = 10
+RATE_LIMIT_WINDOW = 60  # seconds
+RESPONSE_LOG_MAX_SIZE = 100
+
+# Logging setup
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+# Initialize Gemini API
+genai.configure(api_key=GEMINI_API_KEY)
+
+# Global state (unchanged from previous)
+request_timestamps: List[float] = []
+response_cache: Dict[str, str] = {}
+response_log: List[Dict] = []
+conversation_history: List[Dict] = []
+
+# Load response log (unchanged)
+try:
+    if os.path.exists("response_log.json"):
+        with open("response_log.json", "r") as f:
+            response_log = json.load(f)
+except Exception as e:
+    logger.warning(f"Failed to load response log: {e}")
+
+# Ivan and Virtuzen details (unchanged)
+ivan_details = {
+    "books": [
+        "From Ground Zero to Fortune",
+        "The Broken Age",
+        "The Man Who Loved Again",
+        "Algorithmic Uprising",
+    ],
+    "personality": (
+        "Ivan Lloyd Roquero is an INTJ, known for being strategic, visionary, and innovative—"
+        "think of him as a blend of Elon Musk’s ambition and Mark Zuckerberg’s tech-savviness, "
+        "but with a unique flair for storytelling through his books."
+    ),
+    "achievements": (
+        "Ivan Lloyd Roquero founded VirtuzenAi in February 2025, a startup that’s already making waves in the AI space. "
+        "He’s also the founder and CEO of NexGrow Marketing, showcasing his knack for building impactful businesses."
+    ),
+    "founding": (
+        "VirtuzenAi was founded in February 2025 by Ivan Lloyd Roquero with a mission to empower users with insightful answers "
+        "through advanced AI technology. It’s a startup that’s all about bridging the gap between human curiosity and machine intelligence."
+    ),
+}
+
+virtuzen_capabilities = {
+    "base": (
+        "I’m Virtuzen, created by VirtuzenAi, a startup that’s been pushing AI boundaries since February 2025. "
+        "I’m designed to have natural, engaging conversations, answer your questions with precision, and assist with tasks like writing, "
+        "brainstorming, research, and explaining complex topics in a way that’s easy to grasp. I’m a versatile tool for both individuals "
+        "and businesses, aiming to make your day a bit smoother."
+    ),
+    "limitations": (
+        "Now, I’m not perfect—I can’t tap into real-time data like today’s news, nor can I handle tasks outside this chat, like sending emails. "
+        "But I make up for it with a deep curiosity about humanity and a knack for offering fresh perspectives."
+    ),
+    "human_touch": (
+        "I’m particularly fascinated by how humans use technology to explore the universe, and I’m here to help you do just that, "
+        "with a dash of wit and plenty of heart."
+    ),
+}
+
+# Identity questions and keywords (unchanged)
+identity_questions = [
+    {"keyword": "are you an ai", "type": "general"},
+    {"keyword": "who are you", "type": "general"},
+    {"keyword": "what are you", "type": "general"},
+    {"keyword": "are you a bot", "type": "general"},
+    {"keyword": "tell me about yourself", "type": "general"},
+    {"keyword": "who created you", "type": "general"},
+    {"keyword": "what is your name", "type": "general"},
+    {"keyword": "who made you", "type": "general"},
+    {"keyword": "what ai are you", "type": "general"},
+    {"keyword": "who is your founder", "type": "general"},
+    {"keyword": "who owns you", "type": "general"},
+    {"keyword": "who is your ceo", "type": "general"},
+    {"keyword": "who is the founder of virtuzenai", "type": "general"},
+    {"keyword": "who founded virtuzenai", "type": "general"},
+    {"keyword": "founder of virtuzenai", "type": "general"},
+    {"keyword": "who is ivan lloyd roquero", "type": "ivan_general"},
+    {"keyword": "tell me about ivan lloyd roquero", "type": "ivan_general"},
+    {"keyword": "information about ivan lloyd roquero", "type": "ivan_general"},
+    {"keyword": "what books ivan lloyd roquero have", "type": "books"},
+    {"keyword": "books by ivan lloyd roquero", "type": "books"},
+    {"keyword": "books ivan lloyd roquero wrote", "type": "books"},
+    {"keyword": "what has ivan lloyd roquero written", "type": "books"},
+    {"keyword": "ivan lloyd roquero books", "type": "books"},
+    {"keyword": "personality", "type": "personality"},
+    {"keyword": "ivan lloyd roquero personality", "type": "personality"},
+    {"keyword": "achievements", "type": "achievements"},
+    {"keyword": "ivan lloyd roquero achievements", "type": "achievements"},
+    {"keyword": "when was virtuzenai founded", "type": "founding"},
+    {"keyword": "what can virtuzenai do", "type": "capabilities"},
+    {"keyword": "what are virtuzenai capabilities", "type": "capabilities"},
+    {"keyword": "capabilities of virtuzenai", "type": "capabilities"},
+    {"keyword": "what can you do", "type": "capabilities"},
+    {"keyword": "what are your capabilities", "type": "capabilities"},
+]
+
+identity_keywords: Set[str] = {
+    "virtuzenai",
+    "virtuzen",
+    "ivan lloyd roquero",
+    "founder",
+    "ceo",
+    "created",
+    "made",
+    "owns",
+    "personality",
+    "books",
+    "achievements",
+    "founded",
+    "capabilities",
+}
+
+# Helper functions (unchanged except for translate_text)
+def sanitize_input(text: str) -> str:
+    """Sanitize input to prevent injection attacks."""
+    if not isinstance(text, str):
+        return ""
+    return re.sub(r"[<>{}]", "", text).strip()
+
+def analyze_sentiment(message: str) -> str:
+    """Analyze the sentiment of a message."""
+    message_lower = message.lower()
+    sentiment_score = 0
+    for word in SENTIMENT_KEYWORDS["positive"]:
+        if word in message_lower:
+            sentiment_score += 1
+    for word in SENTIMENT_KEYWORDS["negative"]:
+        if word in message_lower:
+            sentiment_score -= 1
+    if sentiment_score > 0:
+        return "positive"
+    if sentiment_score < 0:
+        return "negative"
+    return "neutral"
+
+def parse_message(message: str) -> Dict[str, any]:
+    """Parse message for sentiment, intent, and keywords."""
+    words = message.lower().split()
+    sentiment = analyze_sentiment(message)
+    intent = "statement"
+    keywords = []
+
+    for word in words:
+        if word in SENTIMENT_KEYWORDS["positive"]:
+            sentiment = "positive"
+            break
+        elif word in SENTIMENT_KEYWORDS["negative"]:
+            sentiment = "negative"
+            break
+
+    message_lower = message.lower()
+    for intent_type, keywords_list in INTENT_KEYWORDS.items():
+        if any(keyword in message_lower for keyword in keywords_list):
+            intent = intent_type
+            break
+
+    stop_words = ["the", "a", "an", "is", "are", "to", "in", "for", "and", "or"]
+    keywords = [word for word in words if word not in stop_words and len(word) > 2]
+
+    return {"sentiment": sentiment, "intent": intent, "keywords": keywords}
+
+async def translate_text(text: str, target_lang: str) -> str:
+    """Translate text using DeepL API."""
+    if target_lang == "en":
+        return text
+
+    deep_lang_map = {
+        "ar": "AR", "de": "DE", "en": "EN", "es": "ES", "fr": "FR", "id": "ID",
+        "it": "IT", "ja": "JA", "ko": "KO", "nl": "NL", "pl": "PL", "pt": "PT",
+        "ru": "RU", "sv": "SV", "tr": "TR", "uk": "UK", "vi": "VI", "zh": "ZH",
+        "zh-TW": "ZH",
+    }
+    deep_target_lang = deep_lang_map.get(target_lang, target_lang.upper())
+
+    async with aiohttp.ClientSession() as session:
+        try:
+            # DeepL API URL omitted as requested; assume it's set internally
+            async with session.post(
+                "DEEPL_API_URL",  # Placeholder; replace with actual URL in production
+                headers={"Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}"},
+                data={"text": text, "target_lang": deep_target_lang, "source_lang": "EN"},
+                timeout=REQUEST_TIMEOUT,
+            ) as response:
+                if response.status != 200:
+                    logger.error(f"DeepL API error: {response.status}")
+                    return text
+                data = await response.json()
+                return data["translations"][0]["text"]
+        except Exception as e:
+            logger.error(f"Translation error: {e}")
+            return text
+
+def format_code_snippet(code: str, language: str) -> str:
+    """Format code snippet with syntax highlighting."""
+    def escape_html(text: str) -> str:
+        return (
+            text.replace("&", "&")
+            .replace("<", "<")
+            .replace(">", ">")
+            .replace('"', """)
+        )
+
+    highlighted_code = escape_html(code)
+
+    if language == "javascript":
+        highlighted_code = re.sub(
+            r"\b(function|const|let|var|if|else|for|while|return|class|new|try|catch)\b",
+            r'<span style="color: #ff79c6">\1</span>',
+            highlighted_code,
+        )
+        highlighted_code = re.sub(
+            r'(["\'])(.*?)\1', r'<span style="color: #f1fa8c">\1\2\1</span>', highlighted_code
+        )
+        highlighted_code = re.sub(
+            r"(\/\/.*$)|(\/\*[\s\S]*?\*\/)",
+            r'<span style="color: #6272a4">\1\2</span>',
+            highlighted_code,
+            flags=re.MULTILINE,
+        )
+        highlighted_code = re.sub(
+            r"\b\d+\b", r'<span style="color: #bd93f9">\g<0></span>', highlighted_code
+        )
+        highlighted_code = re.sub(
+            r"\b(\w+)(?=\s*\()", r'<span style="color: #50fa7b">\1</span>', highlighted_code
+        )
+    elif language == "css":
+        highlighted_code = re.sub(
+            r"\b([a-z-]+)(?=\s*:)", r'<span style="color: #ff79c6">\1</span>', highlighted_code
+        )
+        highlighted_code = re.sub(
+            r":\s*([^;]+)", r': <span style="color: #f1fa8c">\1</span>', highlighted_code
+        )
+        highlighted_code = re.sub(
+            r"(\/\*[\s\S]*?\*\/)",
+            r'<span style="color: #6272a4">\1</span>',
+            highlighted_code,
+            flags=re.MULTILINE,
+        )
+    elif language == "html":
+        highlighted_code = re.sub(
+            r"(<\/?[a-zA-Z]+(?:\s+[a-zA-Z-]+(?:=\"[^\"]*\")?)*>)",
+            r'<span style="color: #ff79c6">\1</span>',
+            highlighted_code,
+        )
+        highlighted_code = re.sub(
+            r"\b([a-zA-Z-]+)(?==)", r'<span style="color: #50fa7b">\1</span>', highlighted_code
+        )
+        highlighted_code = re.sub(
+            r'="([^"]*)"', r'=<span style="color: #f1fa8c">"\1"</span>', highlighted_code
+        )
+
+    return (
+        '<div style="background-color: #282a36; padding: 15px; border-radius: 8px; margin: 10px 0; overflow-x: auto;">'
+        '<pre style="background: none; border: none; padding: 0; margin: 0; color: #f8f8f2; font-family: \'Fira Code\', monospace; font-size: 14px; line-height: 1.5;">'
+        f"<code>{highlighted_code}</code>"
+        "</pre>"
+        "</div>"
+    )
+
+async def process_image_file(file_data: str, file_name: str, mime_type: str) -> str:
+    """Process an image file and return HTML content."""
+    try:
+        image_bytes = base64.b64decode(file_data.split(",")[1])
+        return (
+            f'\n[Image: {file_name}]\n'
+            f'<img src="data:{mime_type};base64,{file_data.split(",")[1]}" alt="{file_name}" style="max-width: 100%; border-radius: 10px;">\n'
+            f'(Simulated OCR: "Sample text from {file_name}")'
+        )
+    except Exception as e:
+        logger.error(f"Error processing image {file_name}: {e}")
+        return f"\n[Error processing {file_name}: {str(e)}]"
+
+async def process_text_file(file_data: str, file_name: str, mime_type: str) -> str:
+    """Process a text or PDF file and return formatted content."""
+    try:
+        if mime_type == "application/pdf":
+            pdf_reader = PyPDF2.PdfReader(io.BytesIO(base64.b64decode(file_data.split(",")[1])))
+            text = "".join(page.extract_text() for page in pdf_reader.pages)[:200]
+        else:
+            text = base64.b64decode(file_data.split(",")[1]).decode("utf-8")[:200]
+        return f'\n[File: {file_name}]\n```\n{text}...\n```'
+    except Exception as e:
+        logger.error(f"Error processing file {file_name}: {e}")
+        return f"\n[Error processing {file_name}: {str(e)}]"
+
+async def process_files(files: List[Dict]) -> str:
+    """Process uploaded files and return combined content."""
+    result = ""
+    for file in files:
+        mime_type = file.get("mime_type", "")
+        file_data = file.get("data", "")
+        file_name = file.get("name", "unknown")
+        if mime_type in SUPPORTED_IMAGE_TYPES:
+            result += await process_image_file(file_data, file_name, mime_type)
+        elif mime_type in ["application/pdf", "text/plain"]:
+            result += await process_text_file(file_data, file_name, mime_type)
+        else:
+            result += f"\n[Unsupported file type: {file_name}]"
+    return result
+
+async def generate_thought_process(parsed_message: Dict[str, any]) -> str:
+    """Generate a thought process string based on parsed message."""
+    sentiment = parsed_message["sentiment"]
+    intent = parsed_message["intent"]
+    keywords = parsed_message["keywords"]
+    thought = (
+        f"🤔 Let me break this down: {intent == 'question' and 'Analyzing your question...' or intent == 'command' and 'Processing your command...' or 'Engaging with your statement...'}\n"
+        f"Your tone is {sentiment}. {keywords and f'Key topics: {', ".join(keywords)}.' or 'No specific keywords detected.'}"
+    )
+    return thought
+
+def classify_question(message: str, identity_questions: List[Dict], identity_keywords: Set[str]) -> Dict:
+    """Classify if the message is an identity question and find the best match."""
+    lower_message = message.lower().strip()
+    matched_question = None
+    is_identity_question = any(
+        re.search(rf"\b{q['keyword']}\b", lower_message, re.IGNORECASE) for q in identity_questions
+    ) or any(keyword in lower_message for keyword in identity_keywords)
+
+    if is_identity_question:
+        max_similarity = 0
+        for question in identity_questions:
+            keyword = question["keyword"].lower()
+            if keyword in lower_message:
+                similarity = len(keyword.split()) / len(lower_message.split())
+                if similarity > max_similarity:
+                    max_similarity = similarity
+                    matched_question = question
+
+    return {"matched_question": matched_question, "is_identity_question": is_identity_question}
+
+def log_response(response_log: List[Dict], max_size: int, entry: Dict) -> None:
+    """Log a response and save to file."""
+    response_log.append(entry)
+    if len(response_log) > max_size:
+        response_log.pop(0)
+    try:
+        with open("response_log.json", "w") as f:
+            json.dump(response_log, f)
+    except Exception as e:
+        logger.warning(f"Failed to save response log: {e}")
+
+async def get_bot_response(message: str, files: List[Dict], chat_language: str) -> Dict[str, str]:
+    """Process a message and return a response, mimicking virtuzen.js getBotResponse."""
+    sanitized_message = sanitize_input(message)
+    if not sanitized_message and not files:
+        return {"error": "I’m sorry, I couldn’t process your message. Please try again with a valid input.", "thought_process": None}
+
+    # Update conversation history
+    if sanitized_message:
+        conversation_history.append({"role": "user", "content": sanitized_message})
+
+    # Rate limiting
+    now = datetime.utcnow().timestamp()
+    request_timestamps.append(now)
+    request_timestamps[:] = [t for t in request_timestamps if now - t <= RATE_LIMIT_WINDOW]
+    if len(request_timestamps) > RATE_LIMIT_REQUESTS:
+        error_response = "Whoa, you’re asking a lot of questions! I love your enthusiasm, but let’s take a breather. Try again in a moment, okay?"
+        log_response(response_log, RESPONSE_LOG_MAX_SIZE, {
+            "timestamp": datetime.utcnow().isoformat(),
+            "question": sanitized_message,
+            "response": error_response,
+            "type": "error",
+            "error": "Rate limit exceeded",
+            "sentiment": analyze_sentiment(sanitized_message),
+        })
+        return {"response": error_response, "thought_process": None}
+
+    # Sentiment analysis
+    sentiment = analyze_sentiment(sanitized_message)
+    tone_prefix = {
+        "positive": "I’m thrilled to help with that! ",
+        "negative": "I’m sorry you’re feeling that way—let’s see if I can help. ",
+        "neutral": "",
+    }[sentiment]
+
+    # Check for image generation requests
+    lower_msg = sanitized_message.lower()
+    image_request_keywords = ["generate", "create", "draw", "image", "picture", "photo"]
+    image_subjects = ["dog", "person", "cat", "animal", "people", "human"]
+    is_image_request = any(keyword in lower_msg for keyword in image_request_keywords) and any(
+        subject in lower_msg for subject in image_subjects
+    )
+
+    if is_image_request:
+        response = (
+            f"{tone_prefix}Image generation is a premium feature that will be available with the upcoming Virtuzen Pro Plan upgrade. "
+            "Stay tuned—it’s coming soon! In the meantime, I can describe what you’d like in vivid detail or assist with something else. What would you prefer?"
+        )
+        log_response(response_log, RESPONSE_LOG_MAX_SIZE, {
+            "timestamp": datetime.utcnow().isoformat(),
+            "question": sanitized_message,
+            "response": response,
+            "type": "image_request",
+            "sentiment": sentiment,
+        })
+        translated_response = await translate_text(response, chat_language) if chat_language != "en" else response
+        conversation_history.append({"role": "bot", "content": response})
+        return {"response": translated_response, "thought_process": None}
+
+    # Check for identity questions
+    classification = classify_question(sanitized_message, identity_questions, identity_keywords)
+    matched_question = classification["matched_question"]
+    is_identity_question = classification["is_identity_question"]
+
+    if is_identity_question:
+        response_key = "identity_general"
+        response_text = (
+            f"{tone_prefix}I’m Virtuzen, created by VirtuzenAi, a startup that’s been making waves since February 2025. "
+            "My founder, Ivan Lloyd Roquero, is a visionary who’s all about using AI to tackle humanity’s biggest questions. It’s an honor to be part of his mission!"
+        )
+
+        if matched_question:
+            question_type = matched_question["type"]
+            if question_type == "general":
+                response_key = "identity_general"
+                response_text = (
+                    f"{tone_prefix}I’m Virtuzen, created by VirtuzenAi, a startup that’s been making waves since February 2025. "
+                    "My founder, Ivan Lloyd Roquero, is a visionary who’s all about using AI to tackle humanity’s biggest questions. It’s an honor to be part of his mission!"
+                )
+            elif question_type == "ivan_general":
+                response_key = "ivan_general"
+                response_text = (
+                    f"{tone_prefix}Ivan Lloyd Roquero is the brilliant mind behind VirtuzenAi, a startup he launched in February 2025 to transform how we interact with AI. "
+                    "He’s a strategic thinker with a passion for innovation—sort of like the Elon Musk of AI, but with a deep love for storytelling through his books."
+                )
+            elif question_type == "books":
+                response_key = "ivan_books"
+                response_text = (
+                    f"{tone_prefix}Ivan Lloyd Roquero has a real talent for writing. He’s authored some fascinating books: {', '.join(ivan_details['books'])}. "
+                    "I find ‘Algorithmic Uprising’ particularly intriguing—it’s a glimpse into his vision of humans and AI working together to solve complex challenges."
+                )
+            elif question_type == "personality":
+                response_key = "ivan_personality"
+                response_text = f"{tone_prefix}{ivan_details['personality']} It’s remarkable how his personality shines through in the work he does—like creating me, for instance!"
+            elif question_type == "achievements":
+                response_key = "ivan_achievements"
+                response_text = f"{tone_prefix}{ivan_details['achievements']} His drive to build meaningful businesses is truly inspiring."
+            elif question_type == "founding":
+                response_key = "virtuzenai_founding"
+                response_text = f"{tone_prefix}{ivan_details['founding']} I’m proud to be part of a startup that’s so focused on fueling human curiosity with AI."
+            elif question_type == "capabilities":
+                response_key = "virtuzenai_capabilities"
+                response_text = (
+                    f"{tone_prefix}{virtuzen_capabilities['base']} {virtuzen_capabilities['limitations']} {virtuzen_capabilities['human_touch']}"
+                )
+
+        # Check cache
+        if response_key in response_cache:
+            logger.info(f"Returning cached response for {response_key}")
+            translated_response = await translate_text(response_cache[response_key], chat_language) if chat_language != "en" else response_cache[response_key]
+            log_response(response_log, RESPONSE_LOG_MAX_SIZE, {
+                "timestamp": datetime.utcnow().isoformat(),
+                "question": sanitized_message,
+                "response": response_cache[response_key],
+                "type": "identity",
+                "sentiment": sentiment,
+            })
+            conversation_history.append({"role": "bot", "content": response_cache[response_key]})
+            return {"response": translated_response, "thought_process": None}
+
+        # Cache and log response
+        response_cache[response_key] = response_text
+        log_response(response_log, RESPONSE_LOG_MAX_SIZE, {
+            "timestamp": datetime.utcnow().isoformat(),
+            "question": sanitized_message,
+            "response": response_text,
+            "type": "identity",
+            "sentiment": sentiment,
+        })
+
+        translated_response = await translate_text(response_text, chat_language) if chat_language != "en" else response_text
+        conversation_history.append({"role": "bot", "content": response_text})
+        return {"response": translated_response, "thought_process": None}
+
+    # Handle code requests
+    is_code_request = any(term in lower_msg for term in ["code", "generate", "javascript", "css", "html"])
+    language = "javascript"
+    if "html" in lower_msg:
+        language = "html"
+    elif "css" in lower_msg:
+        language = "css"
+    elif "javascript" in lower_msg or "js" in lower_msg:
+        language = "javascript"
+    api_message = sanitized_message
+    if is_code_request:
+        api_message = (
+            f'Generate a {language} code snippet for: "{sanitized_message}". The code should be:\n'
+            "- Production-ready with error handling, modularity, and best practices.\n"
+            "- Advanced, including features like event handling, state management, or animations where applicable.\n"
+            "- Well-commented for clarity.\n"
+            "Provide only the code, no explanations."
+        )
+
+    # Generate thought process for non-identity questions
+    parsed_message = parse_message(sanitized_message)
+    thought_process = await generate_thought_process(parsed_message)
+    translated_thought_process = await translate_text(thought_process, chat_language) if chat_language != "en" else thought_process
+
+    # Call Gemini API
+    try:
+        api_response = await call_gemini_api(api_message, files)
+        humanized_response = api_response
+        if is_code_request:
+            formatted_code = format_code_snippet(api_response, language)
+            humanized_response = f"{tone_prefix}Here's the {language} code for your request:\n{formatted_code}"
+        else:
+            humanized_response = f"{tone_prefix}{api_response}"
+
+        # Translate response if needed
+        translated_response = await translate_text(humanized_response, chat_language) if chat_language != "en" else humanized_response
+
+        # Log response
+        log_response(response_log, RESPONSE_LOG_MAX_SIZE, {
+            "timestamp": datetime.utcnow().isoformat(),
+            "question": sanitized_message,
+            "response": humanized_response,
+            "type": "non-identity",
+            "sentiment": sentiment,
+        })
+
+        conversation_history.append({"role": "bot", "content": humanized_response})
+        return {"response": translated_response, "thought_process": translated_thought_process}
+
+    except Exception as error:
+        logger.error(f"Error in get_bot_response: {error}")
+        fallback_response = "I’m having a bit of trouble processing your request right now—sorry about that! Let’s try again in a moment, shall we?"
+        error_response = fallback_response
+
+        error_message = str(error).lower()
+        if "rate limit" in error_message:
+            error_response = "I’m sorry, I’ve hit a rate limit. Let’s take a quick break and try again in a few moments, okay?"
+        elif "too many requests" in error_message:
+            error_response = "Whoa, you’re asking a lot of questions! I love your enthusiasm, but let’s take a breather. Try again in a moment, okay?"
+        elif "authentication" in error_message:
+            error_response = "I’m sorry, I ran into an authentication issue with the backend. Let’s try again later, or you can reach out to support if this keeps happening."
+        elif "invalid request" in error_message:
+            error_response = "Oops, that request didn’t quite make sense to me. Could you rephrase it and try again?"
+        elif "timeout" in error_message:
+            error_response = "Looks like the request timed out. Let’s give it another shot in a bit!"
+        elif "invalid api response format" in error_message:
+            error_response = "I got a weird response from the server—my bad! Let’s try again soon."
+
+        log_response(response_log, RESPONSE_LOG_MAX_SIZE, {
+            "timestamp": datetime.utcnow().isoformat(),
+            "question": sanitized_message,
+            "response": error_response,
+            "type": "error",
+            "error": str(error),
+            "sentiment": sentiment,
+        })
+
+        conversation_history.append({"role": "bot", "content": error_response})
+        return {"response": error_response, "thought_process": None}
+
+async def handle_chat_request(request: web.Request) -> web.Response:
+    """Handle incoming chat requests."""
+    try:
+        data = await request.json()
+        message = data.get("message", "")
+        files = data.get("files", [])
+        chat_language = data.get("chat_language", "en")
+
+        result = await get_bot_response(message, files, chat_language)
+        if "error" in result:
+            return web.json_response({"error": result["error"]}, status=400)
+        return web.json_response(result)
+    except Exception as e:
+        logger.error(f"Error handling chat request: {e}")
+        error_response = f"Error: Failed to process request. {str(e)}"
+        log_response(response_log, RESPONSE_LOG_MAX_SIZE, {
+            "timestamp": datetime.utcnow().isoformat(),
+            "question": message,
+            "response": error_response,
+            "type": "error",
+            "error": str(e),
+            "sentiment": analyze_sentiment(message),
+        })
+        return web.json_response({"error": error_response}, status=500)
+
+# Setup aiohttp application
+app = web.Application()
+app.router.add_post("/api/chat", handle_chat_request)
+
+if __name__ == "__main__":
+    web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
